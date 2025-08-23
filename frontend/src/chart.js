@@ -23,7 +23,7 @@ export function SectorBar({rows}) {
   const data = {
     labels,
     datasets: [{ label: '% Change', data: rows.map(r => r.change),
-      borderColor: '#00f7a7', backgroundColor: 'rgba(0,247,167,0.35)' }]
+      borderColor: '#00c805', backgroundColor: 'rgba(0,200,5,0.35)' }]
   }
   return <Bar data={data} options={{
     ...baseOpts,
