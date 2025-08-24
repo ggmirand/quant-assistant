@@ -1,7 +1,6 @@
 # Docker Compose for Quant Assistant
-# - Frontend: Vite (build -> preview)
+# - Frontend: Vite (preview server)
 # - Backend : FastAPI (Uvicorn)
-# Note: No top-level `version:` (deprecated in recent Compose).
 
 name: infra
 
@@ -14,31 +13,11 @@ services:
     ports:
       - "8000:8000"
     environment:
-      # Add real keys in your .env (not committed) and map with env_file if needed
-      # MOCK_MODE=0 enables live data in your backend (assuming provider keys are set)
-      # Example:
-      # - MOCK_MODE=0
-      # - ALPHAVANTAGE_API_KEY=${ALPHAVANTAGE_API_KEY}
       - MOCK_MODE=1
-    # If you want to mount code for hot-reload (dev only), uncomment:
-    # volumes:
-    #   - ../backend:/app:cached
     healthcheck:
-       test:
-        - "CMD-SHELL"
-        - >
-          python - <<'PY'
-          import sys,urllib.request,json
-          try:
-              r=urllib.request.urlopen('http://localhost:8000/health', timeout=3)
-              body=r.read().decode('utf-8','ignore')
-              ok = ('"ok":true' in body) or (json.loads(body).get('ok')==True)
-              sys.exit(0 if ok else 1)
-          except Exception as e:
-              sys.exit(1)
-          PY
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 5
     restart: unless-stopped
 
@@ -52,12 +31,10 @@ services:
         condition: service_healthy
     ports:
       - "5173:5173"
-    # For dev HMR you could mount the folder, but for stability we serve a built preview.
-    # volumes:
-    #   - ../frontend:/ui:cached
     healthcheck:
-      test: ["CMD-SHELL", "wget -qO- http://localhost:5173 || exit 1"]
+      test: ["CMD", "curl", "-f", "http://localhost:5173"]
       interval: 10s
-      timeout: 3s
+      timeout: 5s
       retries: 5
     restart: unless-stopped
+
