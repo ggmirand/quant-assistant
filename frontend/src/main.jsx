@@ -7,6 +7,7 @@ import PayoffChart from './PayoffChart.jsx'
 import Glossary from './Glossary.jsx'
 
 
+
 const Panel = ({title, children, desc, id}) => (
   <section className="panel" aria-labelledby={id}>
     <h3 id={id}>{title}</h3>
