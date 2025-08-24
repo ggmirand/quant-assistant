@@ -3,6 +3,8 @@ import { createRoot } from 'react-dom/client'
 import './style.css'
 import { SectorBar, GainersBar, Histogram } from './charts'
 import PriceVolume from './PriceVolume'
+import PayoffChart from './PayoffChart'
+import Glossary from './Glossary'
 
 const Panel = ({title, children, desc, id}) => (
   <section className="panel" aria-labelledby={id}>
@@ -150,23 +152,52 @@ function App(){
   const [buying,setBuying]=useState(5000)
   const [opt,setOpt]=useState(null); const [optErr,setOptErr]=useState(null); const [optLoad,setOptLoad]=useState(false)
   const [optSelected, setOptSelected] = useState(null)
+  const [underPrice, setUnderPrice] = useState(null)
+
+  // helper: fetch latest price for options symbol (reuses screener API)
+  async function fetchUnderlyingPrice(sym){
+    try{
+      const u=new URL("http://localhost:8000/api/screener/scan")
+      u.searchParams.set("symbols", sym)
+      u.searchParams.set("include_history","0")
+      const r=await fetch(u); const j=await r.json()
+      const first = j?.results?.[0]
+      if (first && isFinite(first.price)) setUnderPrice(Number(first.price))
+    }catch(_) {}
+  }
+
   const runOptions=async()=>{
-    setOptErr(null); setOpt(null); setOptSelected(null); setOptLoad(true)
+    setOptErr(null); setOpt(null); setOptSelected(null); setUnderPrice(null); setOptLoad(true)
     try{
       const u=new URL("http://localhost:8000/api/options/best-trades")
       u.searchParams.set("symbol",optSymbol)
       u.searchParams.set("buying_power", String(buying))
       const r=await fetch(u); const j=await r.json(); setOpt(j)
+      fetchUnderlyingPrice(optSymbol)
     }catch(e){ setOptErr(String(e)) } finally { setOptLoad(false) }
   }
+
+  // ITM/OTM label
+  function itmBadge(row){
+    if (!underPrice || !row) return null
+    const isCall = String(row.type).toUpperCase()==='CALL'
+    const itm = isCall ? underPrice > row.strike : underPrice < row.strike
+    return <span style={{
+      padding:'2px 6px', border:'1px solid var(--border)', borderRadius:6,
+      color: itm? 'var(--bg)' : 'var(--muted)',
+      background: itm? 'var(--ok)' : 'transparent',
+      marginLeft:6, fontSize:12
+    }}>{itm?'ITM':'OTM'}</span>
+  }
+
   const optCols = [
     {key:'expiry', label:'Expiry'},
-    {key:'type', label:'Type'},
+    {key:'type', label:'Type', render:(v,r)=> <>{v}{itmBadge(r)}</>},
     {key:'strike', label:'Strike', render:v=>Number(v).toFixed(2)},
     {key:'delta', label:'Delta', render:v=>Number(v).toFixed(2)},
     {key:'iv', label:'IV', render:v=> (Number(v)*100).toFixed(1)+"%"},
     {key:'prob_finish_above_strike', label:'P(Sₜ>K)', render:v=> isNaN(v)? '—' : (Number(v)*100).toFixed(1)+"%"},
-    {key:'mid_price', label:'Mid', render:v=>Number(v||0).toFixed(2)},
+    {key:'mid_price', label:'Premium', render:v=>Number(v||0).toFixed(2)},
   ]
 
   // Options analysis helpers (no personal advice)
@@ -179,29 +210,38 @@ function App(){
     const probITM = isFinite(c.prob_finish_above_strike) ? Number(c.prob_finish_above_strike) : NaN
     const delta   = isFinite(c.delta) ? Number(c.delta) : NaN
     const iv      = isFinite(c.iv) ? Number(c.iv) : NaN
-
-    // Breakeven at expiry (underlying at T) – approximate, without fees:
-    // Call: S_T = strike + premium ; Put: S_T = strike - premium
     const breakeven = type === 'CALL' ? strike + premium : strike - premium
-
-    // Simple explanatory fields
     const greeks = `Δ=${isNaN(delta)?'—':delta.toFixed(2)}  |  IV=${isNaN(iv)?'—':(iv*100).toFixed(1)}%`
     const probTxt = isNaN(probITM) ? '—' : `${(probITM*100).toFixed(1)}%`
     const payoff = type === 'CALL'
       ? `Max gain: unlimited above strike; Max loss: premium (${formatMoney(premium)}).`
       : `Max gain: strike − premium if stock goes to $0; Max loss: premium (${formatMoney(premium)}).`
-
-    // Plain-English summary for HS student
     const summary = type === 'CALL'
-      ? `This is a CALL. You pay ${formatMoney(premium)} now. If the stock ends above $${strike.toFixed(2)} on expiry, it’s “in‑the‑money.” The model’s chance of that happening is ${probTxt}. You break even if the stock finishes above $${breakeven.toFixed(2)}.`
-      : `This is a PUT. You pay ${formatMoney(premium)} now. If the stock ends below $${strike.toFixed(2)} on expiry, it’s “in‑the‑money.” The model’s chance of that happening (equivalent to finishing below strike) is ${isNaN(probITM)?'—':((1-probITM)*100).toFixed(1)+'%'} if prob shown was for finishing above strike. You break even if the stock finishes below $${breakeven.toFixed(2)}.`
-
-    return {
-      premium, strike, type, breakeven,
-      greeks, probTxt, payoff, summary
-    }
+      ? `This is a CALL. You pay ${formatMoney(premium)} now. If the stock ends above $${strike.toFixed(2)} on expiry, it’s “in the money.” The model’s chance of that is ${probTxt}. You break even if it ends above $${breakeven.toFixed(2)}.`
+      : `This is a PUT. You pay ${formatMoney(premium)} now. If the stock ends below $${strike.toFixed(2)} on expiry, it’s “in the money.” If the shown probability was P(finish above strike), then finishing below has chance ≈ ${isNaN(probITM)?'—':((1-probITM)*100).toFixed(1)+'%'}. Your breakeven is $${breakeven.toFixed(2)} (below).`
+    return { premium, strike, type, breakeven, greeks, probTxt, payoff, summary }
   }
   const optInfo = optionAnalysis(optSelected || (opt?.candidates?.[0] ?? null))
+
+  // Feedback generator (simple rule-based, 8th-grade tone; no personal advice)
+  const [feedbackText, setFeedbackText] = useState('')
+  function generateFeedback(){
+    const parts = []
+    // Stock context (from selected screener row)
+    if (selected){
+      const trend = selected?.signals?.trend_up ? 'uptrend' : 'downtrend'
+      parts.push(`${selected.symbol}: The price is ${trend} based on EMA(12/26). RSI is ${Number(selected.rsi).toFixed(1)}, which hints at ${selected.rsi>=70?'hot/overbought':selected.rsi<=30?'cool/oversold':'normal'} conditions. Volume looks ${((selected.volume_rank_pct||0)*100).toFixed(0)}th percentile in your list. Overall score: ${selected.score}/100.`)
+    }
+    // Option context (selected option candidate)
+    if (optInfo){
+      const itmLabel = underPrice && optSelected
+        ? ((String(optSelected.type).toUpperCase()==='CALL' ? underPrice>optSelected.strike : underPrice<optSelected.strike) ? 'ITM' : 'OTM')
+        : '—'
+      parts.push(`Option: ${optInfo.type} ${optSelected?optSelected.expiry:''} @ $${optInfo.strike.toFixed(2)}. Premium about ${formatMoney(optInfo.premium)}. Breakeven near $${optInfo.breakeven.toFixed(2)}. Δ and IV: ${optInfo.greeks}. Status: ${itmLabel}.`)
+      parts.push(`Plain meaning: This option could make money if the stock moves in the expected direction enough by expiry. Your worst-case loss is the premium you pay. This is just a learning example, not advice.`)
+    }
+    setFeedbackText(parts.join(' '))
+  }
 
   // Monte Carlo
   const [mcSymbol,setMcSymbol]=useState("AAPL")
@@ -324,9 +364,10 @@ function App(){
             <button id="opt-btn" type="submit" className="button">{optLoad? 'Finding…' : 'Find'}</button>
           </div>
         </form>
+        {underPrice && <div className="help" style={{marginBottom:8}}>Underlying price (approx): <b>${underPrice.toFixed(2)}</b></div>}
         {optErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(optErr)}</div>}
         <Table
-          caption="Candidate contracts (educational)"
+          caption="Candidate contracts (educational) — click a row"
           rows={opt?.candidates || []}
           columns={optCols}
           onRowClick={setOptSelected}
@@ -334,7 +375,7 @@ function App(){
           getRowActive={(r)=> optSelected && r.expiry===optSelected.expiry && r.type===optSelected.type && r.strike===optSelected.strike}
         />
 
-        {/* Analysis block */}
+        {/* Analysis block + Payoff chart */}
         <div className="row" style={{marginTop:12}}>
           <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
             <div style={{fontWeight:600, marginBottom:6}}>Contract analysis</div>
@@ -360,6 +401,38 @@ function App(){
               </div>
             ) : <div className="help">Select an option to see a simple explanation.</div>}
           </div>
+        </div>
+
+        {/* Payoff chart */}
+        {optSelected && underPrice && (
+          <div className="panel" style={{marginTop:12}}>
+            <h3 style={{marginBottom:8}}>Payoff at expiry</h3>
+            <div className="help" style={{marginBottom:6}}>
+              Profit/Loss for a single long {String(optSelected.type).toUpperCase()} at different stock prices on expiry.
+            </div>
+            <PayoffChart
+              s0={underPrice}
+              type={String(optSelected.type).toUpperCase()}
+              strike={Number(optSelected.strike)}
+              premium={Number(optSelected.mid_price||0)}
+            />
+          </div>
+        )}
+      </Panel>
+
+      {/* FEEDBACK GENERATOR */}
+      <Panel id="feedback" title="Feedback Generator" desc="Creates a short, plain‑English summary for learning (not advice).">
+        <div className="row">
+          <div className="input" style={{flex:'1 1 520px'}}>
+            <button className="button" onClick={generateFeedback}>Generate summary from selections</button>
+            <div className="help">Uses the selected stock (from Screener) and/or selected option to write a short explanation in 8th‑grade language.</div>
+          </div>
+        </div>
+        <div className="card">
+          <div style={{whiteSpace:'pre-wrap'}} className="help">{feedbackText || 'Click the button to generate a summary.'}</div>
+        </div>
+        <div className="help" style={{marginTop:8}}>
+          This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
         </div>
       </Panel>
 
@@ -400,6 +473,8 @@ function App(){
         }
         {mcErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(mcErr)}</div>}
       </Panel>
+
+      <Glossary />
 
       <footer className="help" role="contentinfo" style={{marginTop:16}}>
         This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
