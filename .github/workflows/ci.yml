@@ -38,15 +38,14 @@ jobs:
         with:
           node-version: "20"
           cache: "npm"
-          cache-dependency-path: frontend/package-lock.json
+          # Use package.json so cache works even without a checked-in lockfile
+          cache-dependency-path: frontend/package.json
 
-      # Use npm install (tolerant) instead of npm ci (requires lockfile match)
       - name: Frontend install
         working-directory: frontend
         run: |
           npm install --no-audit --no-fund
 
-      # Build the Vite app; don't fail CI on warnings
       - name: Frontend build
         env:
           CI: "false"
@@ -54,7 +53,7 @@ jobs:
         run: |
           npm run build
 
-      # ---------- Upload built frontend as artifact (optional) ----------
+      # Optional: upload dist for inspection
       - name: Upload frontend dist
         if: always()
         uses: actions/upload-artifact@v4
