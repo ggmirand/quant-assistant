@@ -8,12 +8,11 @@ on:
 jobs:
   build-and-smoke:
     runs-on: ubuntu-latest
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # ---------- Backend: install + import smoke ----------
+      # --- Backend ---
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
@@ -32,31 +31,31 @@ jobs:
           print("FastAPI & Uvicorn imports OK")
           PY
 
-      # ---------- Frontend: install + build ----------
+      # --- Frontend ---
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
           node-version: "20"
           cache: "npm"
-          # Use package.json so cache works even without a checked-in lockfile
+          # Use package.json so cache works even if lockfile isn't committed
           cache-dependency-path: frontend/package.json
 
-      - name: Frontend install
+      - name: Show frontend files (debug)
+        run: ls -la frontend
+
+      - name: Frontend install (no lockfile required)
         working-directory: frontend
-        run: |
-          npm install --no-audit --no-fund
+        run: npm install --no-audit --no-fund
 
       - name: Frontend build
-        env:
-          CI: "false"
+        env: { CI: "false" }
         working-directory: frontend
-        run: |
-          npm run build
+        run: npm run build
 
-      # Optional: upload dist for inspection
-      - name: Upload frontend dist
+      - name: Upload build artifact (optional)
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: frontend-dist
           path: frontend/dist
+
