@@ -1,10 +1,11 @@
 import React, {useEffect, useMemo, useState} from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
-import { SectorBar, GainersBar, Histogram } from './charts'
-import PriceVolume from './PriceVolume'
-import PayoffChart from './PayoffChart'
-import Glossary from './Glossary'
+import { SectorBar, GainersBar, Histogram } from './charts.jsx'
+import PriceVolume from './PriceVolume.jsx'
+import PayoffChart from './PayoffChart.jsx'
+import Glossary from './Glossary.jsx'
+
 
 const Panel = ({title, children, desc, id}) => (
   <section className="panel" aria-labelledby={id}>
