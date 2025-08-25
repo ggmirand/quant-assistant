@@ -94,7 +94,6 @@ function SuggestionCard({sug}){
 }
 
 function App(){
-  // API health
   const [apiOk,setApiOk]=useState(null)
   useEffect(()=>{ fetch("http://localhost:8000/health").then(r=>r.json()).then(()=>setApiOk(true)).catch(()=>setApiOk(false)) },[])
 
@@ -121,7 +120,6 @@ function App(){
     ticker: x.ticker, price: x.price, change: x.change_percentage
   })), [gainers])
 
-  // Sector drill-down
   const [pickedSector, setPickedSector] = useState(null)
   const [bp, setBP] = useState(3000)
   const [sectorIdeas, setSectorIdeas] = useState(null)
@@ -180,7 +178,7 @@ function App(){
   ]
   const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
 
-  // My Ticker (Options)
+  // Options — My Ticker
   const [mySym,setMySym]=useState("AAPL")
   const [myBP,setMyBP]=useState(5000)
   const [myIdea,setMyIdea]=useState(null)
@@ -211,7 +209,7 @@ function App(){
         This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
       </div>
 
-      {/* MARKET */}
+      {/* MARKET HIGHLIGHTS */}
       <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 ideas + insight + headlines.">
         {mhNote && <div role="alert" className="help" style={{color:'var(--danger)'}}>{mhNote}</div>}
         <div className="row">
@@ -221,6 +219,7 @@ function App(){
               <button className="button" onClick={loadHighlights}>Reload</button>
             </div>
             <SectorBar rows={topSectors} onBarClick={(row)=>{ setPickedSector(row.sector); loadSectorIdeas(row.sector) }}/>
+            {!topSectors.length && <div className="help">No sector data.</div>}
           </div>
           <div style={{flex:'1 1 420px', minWidth:320}}>
             <div className="help" style={{marginBottom:6}}>Top gainers (real tickers)</div>
@@ -259,7 +258,7 @@ function App(){
       <Panel id="screener" title="Quick Screener" desc="Type tickers, run, then click a row to see details.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();runScan()}}>
           <div className="input" style={{flex:'1 1 520px'}}>
-            <label htmlFor="tickers">Tickers (comma‑separated)</label>
+            <label htmlFor="tickers">Tickers (comma-separated)</label>
             <input id="tickers" value={symbols} onChange={e=>setSymbols(e.target.value)} />
           </div>
           <div className="input">
@@ -290,7 +289,7 @@ function App(){
                   <div className="help">Price: <b>{Number(selected.price).toFixed(2)}</b></div>
                   <div className="help">RSI(14): <b>{Number(selected.rsi).toFixed(1)}</b></div>
                   <div className="help">EMA(12)/(26): <b>{Number(selected.ema_short).toFixed(2)}</b> / <b>{Number(selected.ema_long).toFixed(2)}</b></div>
-                  <div className="help">5‑day return: <b>{isNaN(selected.mom_5d)?'—':(Number(selected.mom_5d)*100).toFixed(1)+'%'}</b></div>
+                  <div className="help">5-day return: <b>{isNaN(selected.mom_5d)?'—':(Number(selected.mom_5d)*100).toFixed(1)+'%'}</b></div>
                   <div className="help">Volume: <b>{Number(selected.volume).toLocaleString()}</b></div>
                 </div>
               </div>
@@ -329,3 +328,4 @@ function App(){
 }
 
 createRoot(document.getElementById('root')).render(<App/>)
+
