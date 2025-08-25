@@ -1,7 +1,7 @@
 services:
   api:
     build:
-      context: ../backend    # build FROM the backend folder (relative to infra/)
+      context: ../backend
       dockerfile: Dockerfile
     image: infra-api
     restart: unless-stopped
@@ -16,7 +16,7 @@ services:
 
   frontend:
     build:
-      context: ../frontend   # build FROM the frontend folder (relative to infra/)
+      context: ../frontend
       dockerfile: Dockerfile
     image: infra-frontend
     restart: unless-stopped
@@ -26,7 +26,8 @@ services:
       api:
         condition: service_healthy
     healthcheck:
-      test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
+      # use curl (installed in Dockerfile) instead of wget
+      test: ["CMD", "curl", "-fsS", "http://localhost:5173/"]
       interval: 15s
       timeout: 5s
       retries: 4
