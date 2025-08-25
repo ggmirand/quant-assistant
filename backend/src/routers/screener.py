@@ -10,7 +10,6 @@ try:
 except Exception:
     yf = None
 
-# Pull options suggestion if available
 try:
     from .options import pick_contracts_for_symbol
 except Exception:
@@ -18,7 +17,7 @@ except Exception:
 
 router = APIRouter()
 
-UA = "Mozilla/5.0 (compatible; QuantAssistant/0.4)"
+UA = "Mozilla/5.0 (compatible; QuantAssistant/0.5)"
 S = requests.Session()
 S.headers.update({"User-Agent": UA, "Accept": "application/json"})
 
@@ -27,7 +26,6 @@ def _req_json(url, params=None, timeout=5.0):
     r.raise_for_status()
     return r.json()
 
-# -------- Sectors (no 500) --------
 SECTOR_ETF_MAP = {
     "Materials": "XLB",
     "Energy": "XLE",
@@ -69,7 +67,6 @@ def sectors() -> Dict[str, Any]:
     note = None if out else "sector data temporarily unavailable"
     return {"Rank A: Real-Time Performance": out, "note": note, "as_of": dt.datetime.utcnow().isoformat(timespec="seconds")+"Z"}
 
-# -------- Top gainers (Yahoo predefined) --------
 def yahoo_day_gainers(count=24):
     url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
     j = _req_json(url, params={"count": str(count), "scrIds": "day_gainers"})
@@ -100,7 +97,6 @@ def top_movers():
     except Exception as e:
         return {"top_gainers": [], "note": f"top gainers unavailable: {type(e).__name__}"}
 
-# -------- Quick Screener --------
 def _rsi14(series):
     import numpy as np
     s = series.dropna()
@@ -124,6 +120,7 @@ def scan(
     history_days: int = Query(180, ge=30, le=400),
 ):
     results = []
+    note = None
     if yf is None:
         return {"results": [], "note": "yfinance not installed"}
     for t in [x.strip().upper() for x in symbols.split(",") if x.strip()]:
@@ -131,6 +128,7 @@ def scan(
             tk = yf.Ticker(t)
             hist = tk.history(period=f"{max(60, history_days)}d", interval="1d")
             if hist is None or hist.empty:
+                note = (note or "no history for one or more tickers")
                 continue
             close = hist["Close"].dropna()
             vol = hist["Volume"].dropna()
@@ -151,11 +149,14 @@ def scan(
             results.append(row)
             time.sleep(0.02)
         except Exception:
+            note = (note or "data error for one or more tickers")
             continue
     results.sort(key=lambda r: r.get("score", 0.0), reverse=True)
-    return {"results": results, "note": None}
+    if not results:
+        note = note or "no results (symbols invalid or rate-limited)"
+    return {"results": results, "note": note}
 
-# -------- Sector ideas (+ insight) --------
+# -------- sector ideas with headlines/insight (unchanged) --------
 SECTOR_UNIVERSE = {
     "Technology": ["AAPL","MSFT","NVDA","AMD","AVGO","CRM","ADBE","QCOM"],
     "Communication Services": ["META","GOOGL","NFLX","DIS"],
@@ -189,18 +190,8 @@ def _news_for_symbols(symbols: List[str], limit=4) -> List[dict]:
     return out[:limit]
 
 def _mini_insight(sector: str, symbols: List[str]) -> str:
-    """Simple, 8th‑grade summary: who’s leading, why it may be moving (from headlines)."""
-    # get intraday % change for a few symbols
     leaders=[]
     if yf is not None:
-        try:
-            qs = yf.download(" ".join(symbols[:6]), period="2d", interval="1d", progress=False, auto_adjust=False, group_by="ticker")
-            if isinstance(qs, pd.DataFrame) and "Close" in qs.columns:
-                # when only one ticker, structure differs—skip to keep simple
-                pass
-        except Exception:
-            pass
-        # fallback using fast_info
         for s in symbols[:5]:
             try:
                 t=yf.Ticker(s); fi=t.fast_info or {}
@@ -211,9 +202,9 @@ def _mini_insight(sector: str, symbols: List[str]) -> str:
             except Exception: continue
     leaders=sorted(leaders, key=lambda x:-x[1])[:3]
     if not leaders:
-        return f"{sector} is active. We picked a few liquid names and scanned options or shares based on trend, momentum, and liquidity."
+        return f"{sector} is active. We pick liquid names and scan options/shares using trend, momentum, and liquidity."
     top = ", ".join([f"{sym} ({chg:.1f}%)" for sym,chg in leaders])
-    return f"{sector} is moving with leaders like {top}. We choose ideas by trend (EMA), momentum, option liquidity, and affordability."
+    return f"{sector} is moving with leaders like {top}. We choose ideas by EMA trend, momentum, option liquidity, and affordability."
 
 @router.get("/sector-ideas")
 def sector_ideas(sector: str = Query(...), buying_power: float = Query(3000.0, ge=0.0)):
@@ -221,8 +212,6 @@ def sector_ideas(sector: str = Query(...), buying_power: float = Query(3000.0, g
     ticks = SECTOR_UNIVERSE.get(sector, [])
     if not ticks:
         return {"sector": sector, "ideas": [], "news": [], "insight": "Unknown or unsupported sector."}
-
-    # ideas (prefer options)
     ideas = []
     if pick_contracts_for_symbol:
         for t in ticks:
@@ -235,10 +224,8 @@ def sector_ideas(sector: str = Query(...), buying_power: float = Query(3000.0, g
                     if len(ideas) >= 6: break
             except Exception:
                 continue
-    # rank & trim
     if len(ideas) > 3:
         ideas = sorted(ideas, key=lambda x: (-x.get("confidence",0), - (x.get("sim") or {}).get("pl_p50",-9999)))[:3]
-
     news = _news_for_symbols([i.get("symbol") for i in ideas], limit=4)
     insight = _mini_insight(sector, ticks)
     return {"sector": sector, "ideas": ideas[:3], "news": news, "insight": insight}
