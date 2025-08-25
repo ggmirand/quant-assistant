@@ -1,104 +1,241 @@
+# backend/src/routers/screener.py
 from fastapi import APIRouter, Query
-from ..services import data_providers as dp
-import numpy as np
+import datetime as dt
+import time
+import requests
+from typing import Dict, Any, List
+
+try:
+    import yfinance as yf
+except Exception:
+    yf = None
+
+# Reuse our option idea engine
+try:
+    from .options import pick_contracts_for_symbol
+except Exception:
+    pick_contracts_for_symbol = None
 
 router = APIRouter()
 
+UA = "Mozilla/5.0 (compatible; QuantAssistant/1.0)"
+S = requests.Session()
+S.headers.update({"User-Agent": UA, "Accept": "application/json"})
+
+def _req_json(url, params=None, retries=2, timeout=5.0):
+    last = None
+    for i in range(retries+1):
+        try:
+            r = S.get(url, params=params, timeout=timeout)
+            if r.status_code == 429:
+                last = RuntimeError("429 Too Many Requests")
+                time.sleep(0.6 if i < retries else 0)
+                continue
+            r.raise_for_status()
+            return r.json()
+        except Exception as e:
+            last = e
+            time.sleep(0.4 if i < retries else 0)
+    raise last
+
+# --- Sector performance (kept lightweight) ---
+# We’ll fetch SPDR sector ETFs as a proxy: XLB,XLE,XLK,XLY,XLP,XLV,XLI,XLF,XLU,XLC,XLRE
+SECTOR_ETF_MAP = {
+    "Materials": "XLB",
+    "Energy": "XLE",
+    "Technology": "XLK",
+    "Consumer Discretionary": "XLY",
+    "Consumer Staples": "XLP",
+    "Health Care": "XLV",
+    "Industrials": "XLI",
+    "Financials": "XLF",
+    "Utilities": "XLU",
+    "Communication Services": "XLC",
+    "Real Estate": "XLRE",
+}
+
+def _pct_change_yesterday_close(symbol: str) -> float | None:
+    if yf is None:
+        return None
+    try:
+        hist = yf.Ticker(symbol).history(period="5d", interval="1d")
+        c = hist["Close"].dropna()
+        if len(c) < 2:
+            return None
+        return float((c.iloc[-1] / c.iloc[-2] - 1.0) * 100.0)
+    except Exception:
+        return None
+
 @router.get("/sectors")
-def sectors():
-    return dp.sector_performance()
+def sectors() -> Dict[str, Any]:
+    """Return simple sector % change using SPDR ETFs as proxies."""
+    out = {}
+    for name, etf in SECTOR_ETF_MAP.items():
+        chg = _pct_change_yesterday_close(etf)
+        if chg is None:
+            continue
+        out[name] = f"{chg:.2f}%"
+    return {"Rank A: Real-Time Performance": out, "as_of": dt.datetime.utcnow().isoformat(timespec="seconds")+"Z"}
+
+# --- Real top gainers (Yahoo predefined screener) ---
+def yahoo_day_gainers(count=20) -> List[Dict[str, Any]]:
+    url = "https://query1.finance.yahoo.com/v1/finance/screener/predefined/saved"
+    j = _req_json(url, params={"count": str(count), "scrIds": "day_gainers"})
+    # Structure: finance.result[0].quotes[]
+    quotes = (((j or {}).get("finance") or {}).get("result") or [{}])[0].get("quotes") or []
+    rows = []
+    for q in quotes:
+        sym = q.get("symbol")
+        if not sym or "." in sym:  # skip weird tickers like BRK.B / foreign suffixes
+            continue
+        try:
+            price = float(q.get("regularMarketPrice"))
+            change_pct = float(q.get("regularMarketChangePercent"))
+        except Exception:
+            continue
+        rows.append({
+            "ticker": sym,
+            "price": price,
+            "change_percentage": f"{change_pct:.2f}%",
+            "name": q.get("shortName") or q.get("longName") or sym
+        })
+    return rows
 
 @router.get("/top-movers")
 def top_movers():
-    return dp.top_gainers_losers()
+    """Top gainers (real tickers) via Yahoo predefined screener."""
+    try:
+        gainers = yahoo_day_gainers(25)[:12]
+        return {"top_gainers": gainers}
+    except Exception as e:
+        return {"top_gainers": [], "note": f"top gainers unavailable: {type(e).__name__}"}
 
-@router.get("/scan")
-def scan(
-    symbols: str = Query(..., description="Comma-separated symbols"),
-    ema_short: int = 12,
-    ema_long: int = 26,
-    min_volume: int = 500000,
-    rsi_overbought: int = 70,
-    rsi_oversold: int = 30,
-    include_history: bool = True,
-    history_days: int = 30,
-):
-    """
-    Technical scan with optional recent close/volume history.
-    Returns for each symbol:
-      - price, volume, EMA(12/26), RSI, signals
-      - closes: last N adjusted closes (for charts)
-      - volumes: last N volumes (for charts)
-      - mom_5d: 5-day return
-      - volume_rank_pct: cross-sectional percentile among provided symbols
-      - score: composite 0..100 (trend, volume, RSI closeness to 50, 5d momentum)
-    """
-    raw = []
-    for s in [x.strip().upper() for x in symbols.split(",") if x.strip()]:
-        df = dp.daily_series(s, "compact")
-        if df.empty:
+# --- Sector click-through: 3 best ideas + short news blurb ---
+# Static, high-quality large-cap universe per sector (keeps calls light & fast)
+SECTOR_UNIVERSE = {
+    "Technology": ["AAPL","MSFT","NVDA","AMD","AVGO","CRM","ADBE","QCOM"],
+    "Communication Services": ["META","GOOGL","NFLX","DIS"],
+    "Consumer Discretionary": ["AMZN","TSLA","HD","NKE"],
+    "Consumer Staples": ["WMT","COST","PEP","PG"],
+    "Health Care": ["LLY","UNH","JNJ","MRK","PFE"],
+    "Industrials": ["CAT","BA","UNP","GE"],
+    "Financials": ["JPM","BAC","V","MA","GS"],
+    "Energy": ["XOM","CVX","SLB"],
+    "Materials": ["LIN","APD","FCX"],
+    "Utilities": ["NEE","DUK","SO"],
+    "Real Estate": ["PLD","AMT","EQIX"],
+}
+
+def _quote_batch(symbols: list[str]) -> list[dict]:
+    # Yahoo quote batch
+    url = "https://query2.finance.yahoo.com/v7/finance/quote"
+    j = _req_json(url, params={"symbols": ",".join(symbols[:50])})
+    return ((j or {}).get("quoteResponse") or {}).get("result") or []
+
+def _news_for_symbols(symbols: list[str], limit=4) -> list[dict]:
+    # Yahoo search/news (very light; not perfect but free)
+    out = []
+    for sym in symbols[:3]:
+        try:
+            url = "https://query2.finance.yahoo.com/v1/finance/search"
+            j = _req_json(url, params={"q": sym, "newsCount": str(limit)})
+            news = (j or {}).get("news") or []
+            for n in news[:2]:
+                title = n.get("title")
+                publisher = n.get("publisher")
+                link = None
+                for u in (n.get("linkPresentation") or []):
+                    if isinstance(u, dict) and u.get("url"):
+                        link = u["url"]; break
+                out.append({"symbol": sym, "title": title, "publisher": publisher, "url": link})
+        except Exception:
             continue
-        df["ema_s"] = dp.ema(df["adj_close"], ema_short)
-        df["ema_l"] = dp.ema(df["adj_close"], ema_long)
-        df["rsi"]   = dp.rsi(df["adj_close"])
-        last = df.iloc[-1]
+    return out[:limit]
 
-        # recent closes & volumes for charts + momentum
-        tail = df.tail(max(history_days, 6)).copy()
-        closes = tail["adj_close"].to_list()
-        vols_hist = tail["volume"].to_list()
+@router.get("/sector-ideas")
+def sector_ideas(sector: str = Query(..., description="e.g., Technology"), buying_power: float = Query(3000.0, ge=0.0)):
+    """
+    When user clicks a sector, produce up to 3 best ideas from a curated universe:
+    - If options engine returns a contract: suggest that option (with its probabilities).
+    - Else: suggest simple 'buy shares' with 20-trading-day positive-return probability.
+    """
+    sector = sector.strip()
+    ticks = SECTOR_UNIVERSE.get(sector, [])
+    if not ticks:
+        return {"sector": sector, "ideas": [], "news": [], "note": "Unknown sector or not supported."}
 
-        # 5-day simple return
-        if len(tail) >= 6:
-            mom_5d = float((tail["adj_close"].iloc[-1] / tail["adj_close"].iloc[-6]) - 1.0)
-        else:
-            mom_5d = float("nan")
+    ideas = []
+    for t in ticks:
+        try:
+            if pick_contracts_for_symbol is not None:
+                idea = pick_contracts_for_symbol(t, buying_power)
+                if idea and idea.get("suggestion"):
+                    idea["mode"] = "OPTION"
+                    ideas.append(idea)
+                    time.sleep(0.1)
+                    if len(ideas) >= 6:
+                        break
+        except Exception:
+            continue
 
-        entry = {
-            "symbol": s,
-            "price": float(last["adj_close"]),
-            "volume": int(last["volume"]),
-            "ema_short": float(last["ema_s"]),
-            "ema_long": float(last["ema_l"]),
-            "rsi": float(last["rsi"]),
-            "signals": {
-                "trend_up": bool(last["ema_s"] > last["ema_l"]),
-                "oversold": bool(last["rsi"] <= rsi_oversold),
-                "overbought": bool(last["rsi"] >= rsi_overbought),
-                "meets_min_volume": bool(last["volume"] >= min_volume),
-            },
-            "mom_5d": mom_5d,
-        }
-        if include_history:
-            entry["closes"] = closes[-history_days:]
-            entry["volumes"] = vols_hist[-history_days:]
+    # If not enough options, fill with simple share suggestions (fallback)
+    if len(ideas) < 3 and yf is not None:
+        for t in ticks:
+            try:
+                if any(x.get("symbol")==t for x in ideas):
+                    continue
+                hist = yf.Ticker(t).history(period="1y", interval="1d")
+                c = hist["Close"].dropna()
+                if len(c) < 60:
+                    continue
+                # Estimate chance that 20d forward return > 0 under normal approx
+                import numpy as np
+                lr = np.log(c / c.shift(1)).dropna().values
+                mu_d, sig_d = float(np.mean(lr)), float(np.std(lr))
+                T = 20.0
+                mu_T = mu_d * T
+                sig_T = sig_d * (T**0.5)
+                # P(R_T > 0) = P(Z > -mu_T/sig_T)
+                import math
+                from math import erf, sqrt
+                if sig_T <= 0:
+                    p_pos = 0.5
+                else:
+                    z = -mu_T / sig_T
+                    p_pos = 0.5 * (1 - erf(z / sqrt(2)))
 
-        raw.append(entry)
+                # simple thought/explain
+                thought = [
+                    "Fallback to shares due to thin/expensive options or rate limits.",
+                    "Used 1‑year daily returns to estimate 20‑day probability of gain.",
+                ]
+                explain = (f"This is a simple share buy idea. Over about a month (20 trading days), "
+                           f"based on the past year’s moves, this stock has roughly a {(p_pos*100):.1f}% chance "
+                           f"to end higher than today. You can still lose money if the price falls.")
 
-    if not raw:
-        return {"results": []}
+                ideas.append({
+                    "symbol": t,
+                    "under_price": float(c.iloc[-1]),
+                    "mode": "SHARES",
+                    "explanation": explain,
+                    "thought_process": thought,
+                    "confidence": int(max(30, min(80, p_pos*100))),  # heuristic
+                    "share_probability_up_20d": p_pos,
+                })
+                time.sleep(0.05)
+                if len(ideas) >= 3:
+                    break
+            except Exception:
+                continue
 
-    # Cross-sectional volume percentile
-    vols = np.array([r["volume"] for r in raw], dtype=float)
-    order = vols.argsort()
-    pct = np.empty_like(order, dtype=float)
-    pct[order] = np.arange(len(vols)) / max(len(vols) - 1, 1)
-    for i, r in enumerate(raw):
-        r["volume_rank_pct"] = float(pct[i])
+    # rank: prefer OPTION ideas by confidence, else SHARES by prob
+    def key_fn(x):
+        conf = x.get("confidence", 0)
+        med = (x.get("sim") or {}).get("pl_p50", -9999)
+        prob = x.get("share_probability_up_20d", 0)
+        return (-conf, -med, -prob)
 
-    # Composite score 0..100
-    def clamp(x, lo, hi): return max(lo, min(hi, x))
-    for r in raw:
-        trend = 1.0 if r["signals"]["trend_up"] else 0.0
-        volp  = r.get("volume_rank_pct", 0.0)
-        rsi   = r.get("rsi", 50.0)
-        rsi_term = clamp(1.0 - abs((rsi - 50.0)/50.0), 0.0, 1.0)
-        m5 = r.get("mom_5d")
-        if m5 is None or np.isnan(m5): m5 = 0.0
-        m5 = clamp(m5, -1.0, 1.0)
-        m5_term = (m5 + 1.0)/2.0
-        score = 40*trend + 30*volp + 20*rsi_term + 10*m5_term
-        r["score"] = round(float(score), 2)
+    ideas = sorted(ideas, key=key_fn)[:3]
+    news = _news_for_symbols([i.get("symbol") for i in ideas], limit=4)
 
-    raw.sort(key=lambda x: x["score"], reverse=True)
-    return {"results": raw}
+    return {"sector": sector, "ideas": ideas, "news": news}
