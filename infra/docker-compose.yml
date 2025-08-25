@@ -1,56 +1,33 @@
-# Docker Compose for Quant Assistant
-# - Frontend: Vite (preview server)
-# - Backend : FastAPI (Uvicorn)
-
-name: infra
-
 services:
   api:
     build:
-      context: ../backend
+      context: ../backend    # build FROM the backend folder (relative to infra/)
       dockerfile: Dockerfile
-    container_name: infra-api-1
+    image: infra-api
+    restart: unless-stopped
     ports:
       - "8000:8000"
-    environment:
-      - MOCK_MODE=1
     healthcheck:
-      # Use Python inside the container to check /health
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,json,sys,socket; socket.setdefaulttimeout(3); \
-r=urllib.request.urlopen('http://localhost:8000/health'); b=r.read().decode('utf-8','ignore'); \
-sys.exit(0 if ('\"ok\":true' in b or (json.loads(b).get('ok') is True)) else 1)"
-        ]
-      interval: 10s
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/health"]
+      interval: 15s
       timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      retries: 4
+      start_period: 20s
 
   frontend:
     build:
-      context: ../frontend
+      context: ../frontend   # build FROM the frontend folder (relative to infra/)
       dockerfile: Dockerfile
-    container_name: infra-frontend-1
+    image: infra-frontend
+    restart: unless-stopped
+    ports:
+      - "5173:5173"
     depends_on:
       api:
         condition: service_healthy
-    ports:
-      - "5173:5173"
     healthcheck:
-      # Preview server responds with HTML; we just check it serves anything.
-      test:
-        [
-          "CMD",
-          "python",
-          "-c",
-          "import urllib.request,sys,socket; socket.setdefaulttimeout(3); \
-urllib.request.urlopen('http://localhost:5173'); sys.exit(0)"
-        ]
-      interval: 10s
+      test: ["CMD", "wget", "-qO-", "http://localhost:5173/"]
+      interval: 15s
       timeout: 5s
-      retries: 5
-    restart: unless-stopped
+      retries: 4
+      start_period: 10s
