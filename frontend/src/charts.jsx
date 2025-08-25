@@ -1,9 +1,7 @@
 import React from 'react'
 import {
-  Chart as ChartJS,
-  BarElement, BarController,
-  CategoryScale, LinearScale,
-  Tooltip, Legend,
+  Chart as ChartJS, BarElement, BarController,
+  CategoryScale, LinearScale, Tooltip, Legend
 } from 'chart.js'
 import { Bar } from 'react-chartjs-2'
 
@@ -18,7 +16,7 @@ const baseOpts = {
   }
 }
 
-export function SectorBar({rows}) {
+export function SectorBar({rows=[]}) {
   const labels = rows.map(r => r.sector)
   const data = {
     labels,
@@ -27,18 +25,18 @@ export function SectorBar({rows}) {
   }
   return <Bar data={data} options={{
     ...baseOpts,
-    plugins: { ...baseOpts.plugins, tooltip: { callbacks: { label: c => `${c.parsed.y.toFixed(2)}%` } } }
+    plugins: { ...baseOpts.plugins, tooltip: { callbacks: { label: c => `${(c.parsed.y||0).toFixed(2)}%` } } }
   }}/>
 }
 
-export function GainersBar({rows}) {
+export function GainersBar({rows=[]}) {
   const labels = rows.map(r => r.ticker)
   const nums = rows.map(r => parseFloat(String(r.change||'').replace('%','')) || 0)
   const data = { labels, datasets: [{ label: '% Change', data: nums,
     borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.35)' }] }
   return <Bar data={data} options={{
     ...baseOpts,
-    plugins: { ...baseOpts.plugins, tooltip: { callbacks: { label: c => `${c.parsed.y.toFixed(2)}%` } } }
+    plugins: { ...baseOpts.plugins, tooltip: { callbacks: { label: c => `${(c.parsed.y||0).toFixed(2)}%` } } }
   }}/>
 }
 
@@ -57,4 +55,6 @@ export function Histogram({values=[], bins=20, color='#eab308', title='Histogram
   const labels = edges.map((e,i)=> i===0 ? e.toFixed(2) : '')
   const data = { labels, datasets: [{ label: title, data: counts, borderColor: color, backgroundColor: `${color}55` }] }
   return <Bar data={data} options={{ ...baseOpts, plugins: { ...baseOpts.plugins, legend:{display:false} }}}/>
+}
+plugins: { ...baseOpts.plugins, legend:{display:false} }}}/>
 }
