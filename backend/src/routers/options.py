@@ -13,6 +13,7 @@ except Exception:
     yf = None
 
 import requests
+from requests import HTTPError
 
 router = APIRouter()
 
@@ -27,7 +28,6 @@ def call_delta(S,K,T,r,sigma): return norm_cdf(bs_d1(S,K,T,r,sigma))
 def put_delta(S,K,T,r,sigma):  return call_delta(S,K,T,r,sigma) - 1.0
 
 def prob_ST_above_x(S, x, T, r, sigma):
-    # Risk‑neutral chance S_T > x in lognormal model
     if not (S>0 and x>0 and T>0 and sigma>0): return float("nan")
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
@@ -39,30 +39,36 @@ class IdeaReq(BaseModel):
 
 class ScanReq(BaseModel):
     buying_power: float
-    universe: list[str] | None = None  # optional custom universe
+    universe: list[str] | None = None
 
 # ---------------- Yahoo v7 (fallback) ----------------
 UA = "Mozilla/5.0 (compatible; QuantAssistant/1.0)"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA, "Accept": "application/json"})
 
-def _req_json(url, params=None, retries=2, timeout=4.0):
+def _req_json(url, params=None, retries=2, timeout=5.0):
+    """GET JSON with small retry + friendly HTTP error surface."""
     last_err = None
     for i in range(retries+1):
         try:
             r = SESSION.get(url, params=params, timeout=timeout)
             if r.status_code == 429:
-                last_err = RuntimeError("429 Too Many Requests")
-                time.sleep(0.6 if i < retries else 0)
-                continue
+                # Soft backoff and retry
+                time.sleep(0.7 if i < retries else 0)
+                r.raise_for_status()
             r.raise_for_status()
             return r.json()
+        except HTTPError as e:
+            last_err = e
+            # Backoff on 4xx/5xx and retry if allowed
+            time.sleep(0.5 if i < retries else 0)
         except Exception as e:
             last_err = e
             time.sleep(0.4 if i < retries else 0)
     raise last_err
 
 def _v7_options_book(symbol: str):
+    """Minimal options fetch via Yahoo v7 API."""
     base = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
     j0 = _req_json(base)
     res = (j0 or {}).get("optionChain", {}).get("result") or []
@@ -118,6 +124,7 @@ def _v7_options_book(symbol: str):
 def load_chain(symbol: str, min_dte=21, max_dte=45):
     symbol = symbol.upper().strip()
     note = None
+
     # 1) yfinance path
     if yf is not None:
         try:
@@ -149,9 +156,12 @@ def load_chain(symbol: str, min_dte=21, max_dte=45):
                 except Exception as ex:
                     if "429" in str(ex) or "Too Many Requests" in str(ex):
                         note="Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
+                    else:
+                        # keep a generic hint but do NOT fail the whole request
+                        note = note or f"yfinance chain error: {type(ex).__name__}"
                     continue
             if chains:
-                book={"price":S,"expiries":[e for _,e,_ in valid],"chains":chains}
+                book={"price":S,"expiries":[e for _,e,_ in valid],"chains": chains}
                 if note: book["note"]=note
                 return book
         except Exception as ex:
@@ -160,7 +170,7 @@ def load_chain(symbol: str, min_dte=21, max_dte=45):
             else:
                 note=f"yfinance error: {type(ex).__name__}"
 
-    # 2) Yahoo v7 fallback
+    # 2) Yahoo v7 fallback (with explicit HTTP error notes)
     try:
         v7=_v7_options_book(symbol)
         today=dt.date.today()
@@ -178,8 +188,15 @@ def load_chain(symbol: str, min_dte=21, max_dte=45):
         elif note:
             book["note"]=note
         return book
+    except HTTPError as ex:
+        code = getattr(ex.response, "status_code", None)
+        if code == 429:
+            msg = "Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
+        else:
+            msg = f"Data provider HTTP error ({code or 'unknown'}). Try again shortly."
+        return {"price": None, "expiries": [], "chains": [], "note": msg}
     except Exception as ex:
-        msg=str(ex)
+        msg = str(ex)
         if "429" in msg or "Too Many Requests" in msg:
             note="Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
         else:
@@ -204,7 +221,6 @@ def compute_trend(symbol: str):
         return {"trend":"neutral","score":0.0,"notes":["Insufficient history for robust trend."]}
     ema20 = ema(S, 20); ema50 = ema(S, 50)
     ret10 = (S.iloc[-1]/S.iloc[-11] - 1.0) if len(S) > 11 else 0.0
-    # RSI(14)
     delta = S.diff().dropna()
     up = delta.clip(lower=0.0); down = -delta.clip(upper=0.0)
     roll_up = up.ewm(alpha=1/14, adjust=False).mean()
@@ -219,11 +235,8 @@ def compute_trend(symbol: str):
     else: notes.append("EMA20 ≤ EMA50 (down/sideways).")
     if ret10 > 0: score += 0.3; notes.append(f"10‑day momentum +{ret10*100:.1f}%.")
     else: notes.append(f"10‑day momentum {ret10*100:.1f}%.")
-
-    # RSI closeness to 50 -> stability (closer less overbought/oversold)
     score += 0.3 * max(0.0, 1.0 - abs(rsi_val-50)/50)
     notes.append(f"RSI(14) ≈ {rsi_val:.1f}.")
-
     trend = "up" if score >= 0.55 else ("down" if score <= 0.35 else "neutral")
     return {"trend":trend, "score":score, "notes":notes, "rsi": rsi_val}
 
@@ -247,7 +260,6 @@ def enrich_contracts(S, expiry_iso, rows, is_call: bool):
         if not (math.isfinite(S) and K>0 and premium>0): continue
         dlt = call_delta(S,K,T,r,sigma) if is_call else (call_delta(S,K,T,r,sigma)-1.0)
         breakeven = (K + premium) if is_call else (K - premium)
-        # PoP: chance payoff > 0 => S_T > breakeven (call) or < breakeven (put)
         p_profit = prob_ST_above_x(S, breakeven, T, r, sigma) if is_call else (1.0 - prob_ST_above_x(S, breakeven, T, r, sigma))
         out.append({
             "expiry": expiry_iso, "type": "CALL" if is_call else "PUT",
@@ -260,10 +272,8 @@ def enrich_contracts(S, expiry_iso, rows, is_call: bool):
     return out
 
 def confidence_score(c):
-    # 0..100: liquidity (spread/oi/vol), data presence, reasonable greeks
     score = 0
     premium = c.get("mid_price",0)
-    # We don't have spread here (only mid), so use OI/Vol proxies
     oi = c.get("oi",0); vol = c.get("volume",0)
     if oi >= 500: score += 35
     elif oi >= 200: score += 25
@@ -273,7 +283,6 @@ def confidence_score(c):
     elif vol >= 10: score += 6
     if c.get("iv"): score += 15
     if c.get("delta") is not None and 0.1 <= abs(c["delta"]) <= 0.6: score += 15
-    # affordability — higher premium uses more BP (small nudge)
     if premium*100 <= 300: score += 10
     elif premium*100 <= 800: score += 6
     else: score += 2
@@ -300,7 +309,6 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
     payoff = (np.maximum(ST-K,0.0)-premium) if otype.upper()=="CALL" else (np.maximum(K-ST,0.0)-premium)
     p5,p50,p95 = np.percentile(payoff, [5,50,95])
     prob_profit=float((payoff>0).mean())
-    # sample subset to plot as histogram client-side
     if n_paths>sample_out:
         idx=np.linspace(0,n_paths-1,sample_out).astype(int)
         samples=payoff[idx].round(2).tolist()
@@ -309,30 +317,22 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
 def pick_contracts_for_symbol(symbol: str, buying_power: float):
-    # Load book
     book = load_chain(symbol, min_dte=21, max_dte=45)
     S = book.get("price") or 0.0
     if not book.get("chains"):
         return {"note": book.get("note"), "under_price": S, "candidates": []}
     trend = compute_trend(symbol)
-    prefer = trend["trend"]  # up/down/neutral
+    prefer = trend["trend"]
     target_delta = 0.30
 
-    # build all candidates with filters
     cands=[]
     for ch in book["chains"]:
         calls = enrich_contracts(S, ch["expiry"], ch["calls"], True)
         puts  = enrich_contracts(S, ch["expiry"], ch["puts"],  False)
-        rows = []
-        if prefer=="up": rows += calls
-        elif prefer=="down": rows += puts
-        else: rows += calls + puts
+        rows = calls if prefer=="up" else (puts if prefer=="down" else calls+puts)
         for c in rows:
-            # affordability
             if c["mid_price"]*100.0 > buying_power: continue
-            # liquidity gates
             if (c.get("oi",0) < 50) and (c.get("volume",0) < 10): continue
-            # delta proximity
             if c.get("delta") is None: continue
             c["delta_diff"]=abs(abs(c["delta"])-target_delta)
             c["conf"]=confidence_score(c)
@@ -342,20 +342,16 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
     if not cands:
         return {"note": book.get("note") or "No affordable/liquid contracts in DTE window.", "under_price": S, "candidates": []}
 
-    # Rank: delta closeness, higher confidence, nearer expiry (but within window)
     cands_sorted = sorted(cands, key=lambda x: (x["delta_diff"], -x["conf"], x["expiry"]))
     best = cands_sorted[0]
-    # Simulation for best
     days=(dt.date.fromisoformat(best["expiry"])-dt.date.today()).days
     sim=simulate_option_pl_samples(symbol, S, best["strike"], best["mid_price"], days, best["type"])
-    # explanation + thought process
     thought = [
         f"Trend check: {', '.join(trend['notes'])}",
         f"Target delta ≈ 0.30; picked {best['type']} with Δ={best['delta']:.2f} and DTE={days}.",
         f"Liquidity filter: OI={best.get('oi',0)}, Vol={best.get('volume',0)}.",
         f"Affordability: premium ≈ ${best['mid_price']:.2f} (${best['mid_price']*100:.0f} per contract).",
     ]
-    # 8th‑grade explanation
     if best["type"]=="CALL":
         summary=(f"This is a CALL. You pay about ${best['mid_price']:.2f} now. "
                  f"If the stock ends above ${best['breakeven']:.2f} on expiry ({best['expiry']}), you make money; "
@@ -380,10 +376,9 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
         "thought_process": thought
     }
 
-# ---------------- Endpoints ----------------
+# ---------------- Public endpoints ----------------
 @router.get("/idea")
 def idea(symbol: str = Query(...), buying_power: float = Query(..., ge=0.0)):
-    """One best contract for a specific ticker + buying power."""
     return pick_contracts_for_symbol(symbol, buying_power)
 
 DEFAULT_UNIVERSE = [
@@ -393,7 +388,6 @@ DEFAULT_UNIVERSE = [
 
 @router.post("/scan-ideas")
 def scan_ideas(req: ScanReq):
-    """Scan a large-cap universe and return top 1–3 option ideas."""
     uni = [u.upper().strip() for u in (req.universe or DEFAULT_UNIVERSE) if u]
     ideas=[]
     for sym in uni:
@@ -402,11 +396,9 @@ def scan_ideas(req: ScanReq):
             if res.get("suggestion"): ideas.append(res)
         except Exception:
             continue
-        # small pause to be polite to free endpoints
         time.sleep(0.15)
-        if len(ideas) >= 6:  # gather a few then pick best 3
+        if len(ideas) >= 6:
             break
-    # rank by confidence then median simulated P/L if present
     def rank_key(x):
         conf = x.get("confidence",0)
         med  = (x.get("sim") or {}).get("pl_p50", -9999)
