@@ -1,4 +1,3 @@
-# backend/src/routers/options.py
 from fastapi import APIRouter, Query, Body
 from pydantic import BaseModel
 import datetime as dt
@@ -6,14 +5,13 @@ import math
 import time
 import numpy as np
 import pandas as pd
+import requests
+from requests import HTTPError
 
 try:
     import yfinance as yf
 except Exception:
     yf = None
-
-import requests
-from requests import HTTPError
 
 router = APIRouter()
 
@@ -23,54 +21,47 @@ def norm_cdf(x: float) -> float: return 0.5 * (1.0 + math.erf(x / SQRT_2))
 def bs_d1(S, K, T, r, sigma):
     if S <= 0 or K <= 0 or sigma <= 0 or T <= 0: return float("nan")
     return (math.log(S/K) + (r + 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
-def bs_d2(d1, sigma, T): return d1 - sigma*math.sqrt(T) if math.isfinite(d1) and sigma>0 and T>0 else float("nan")
 def call_delta(S,K,T,r,sigma): return norm_cdf(bs_d1(S,K,T,r,sigma))
-def put_delta(S,K,T,r,sigma):  return call_delta(S,K,T,r,sigma) - 1.0
-
 def prob_ST_above_x(S, x, T, r, sigma):
     if not (S>0 and x>0 and T>0 and sigma>0): return float("nan")
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
 
 # ---------------- Models ----------------
-class IdeaReq(BaseModel):
-    symbol: str
-    buying_power: float
-
 class ScanReq(BaseModel):
     buying_power: float
     universe: list[str] | None = None
 
-# ---------------- Yahoo v7 (fallback) ----------------
+# ---------------- HTTP session ----------------
 UA = "Mozilla/5.0 (compatible; QuantAssistant/1.0)"
 SESSION = requests.Session()
 SESSION.headers.update({"User-Agent": UA, "Accept": "application/json"})
 
-def _req_json(url, params=None, retries=2, timeout=5.0):
+def _req_json(url, params=None, retries=1, timeout=5.0):
     """GET JSON with small retry + friendly HTTP error surface."""
     last_err = None
     for i in range(retries+1):
         try:
             r = SESSION.get(url, params=params, timeout=timeout)
-            if r.status_code == 429:
-                # Soft backoff and retry
-                time.sleep(0.7 if i < retries else 0)
-                r.raise_for_status()
+            if r.status_code in (401,403,429,502,503):
+                last_err = HTTPError(f"HTTP {r.status_code}", response=r)
+                time.sleep(0.6 if i < retries else 0)
+                continue
             r.raise_for_status()
             return r.json()
-        except HTTPError as e:
-            last_err = e
-            # Backoff on 4xx/5xx and retry if allowed
-            time.sleep(0.5 if i < retries else 0)
         except Exception as e:
             last_err = e
             time.sleep(0.4 if i < retries else 0)
     raise last_err
 
+# ---------------- Yahoo v7 options (query2 -> query1) ----------------
 def _v7_options_book(symbol: str):
-    """Minimal options fetch via Yahoo v7 API."""
-    base = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
-    j0 = _req_json(base)
+    base_q2 = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
+    base_q1 = f"https://query1.finance.yahoo.com/v7/finance/options/{symbol}"
+    try:
+        j0 = _req_json(base_q2)
+    except Exception:
+        j0 = _req_json(base_q1)
     res = (j0 or {}).get("optionChain", {}).get("result") or []
     if not res:
         return {"price": None, "expiries": [], "chains": []}
@@ -120,12 +111,12 @@ def _v7_options_book(symbol: str):
                            "calls": norm(calls), "puts": norm(puts)})
     return {"price": price, "expiries": expiries, "chains": chains}
 
-# ---------------- Data loading (with fallbacks) ----------------
+# ---------------- Data loading (yfinance first, then v7) ----------------
 def load_chain(symbol: str, min_dte=21, max_dte=45):
     symbol = symbol.upper().strip()
     note = None
 
-    # 1) yfinance path
+    # 1) yfinance path (prefer)
     if yf is not None:
         try:
             tkr = yf.Ticker(symbol)
@@ -146,6 +137,7 @@ def load_chain(symbol: str, min_dte=21, max_dte=45):
                     hist=tkr.history(period="5d", interval="1d")
                     S=float(hist["Close"].dropna().iloc[-1])
                 except Exception: S=None
+
             chains=[]
             for _,e_str,dte in valid:
                 try:
@@ -157,7 +149,6 @@ def load_chain(symbol: str, min_dte=21, max_dte=45):
                     if "429" in str(ex) or "Too Many Requests" in str(ex):
                         note="Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
                     else:
-                        # keep a generic hint but do NOT fail the whole request
                         note = note or f"yfinance chain error: {type(ex).__name__}"
                     continue
             if chains:
@@ -170,7 +161,7 @@ def load_chain(symbol: str, min_dte=21, max_dte=45):
             else:
                 note=f"yfinance error: {type(ex).__name__}"
 
-    # 2) Yahoo v7 fallback (with explicit HTTP error notes)
+    # 2) Yahoo v7 fallback
     try:
         v7=_v7_options_book(symbol)
         today=dt.date.today()
@@ -396,7 +387,7 @@ def scan_ideas(req: ScanReq):
             if res.get("suggestion"): ideas.append(res)
         except Exception:
             continue
-        time.sleep(0.15)
+        time.sleep(0.12)
         if len(ideas) >= 6:
             break
     def rank_key(x):
