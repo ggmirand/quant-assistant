@@ -1,20 +1,18 @@
 FROM node:20-alpine
 
 WORKDIR /ui
-
-# Add curl for healthcheck
 RUN apk add --no-cache curl
 
-# Copy minimal manifest first for caching
+# Copy minimal manifest first for better caching
 COPY package.json vite.config.ts index.html ./
+# If you DO add a lockfile later, uncomment the next line:
+# COPY package-lock.json ./
+
 # App source
 COPY src ./src
 
-# Install deps
-RUN npm ci || npm install
+# Install deps (no npm ci since lockfile is absent)
+RUN npm install
 
 EXPOSE 5173
-
-# Run Vite dev server so 5173 actually serves content
 CMD ["npm", "run", "dev", "--", "--host", "0.0.0.0"]
-
