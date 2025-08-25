@@ -11,7 +11,7 @@ except Exception:
 
 router = APIRouter()
 
-# ---------- Black–Scholes-lite ----------
+# ----- light Black–Scholes bits -----
 SQRT_2 = math.sqrt(2.0)
 def norm_cdf(x: float) -> float: return 0.5 * (1.0 + math.erf(x / SQRT_2))
 def bs_d1(S, K, T, r, sigma):
@@ -23,7 +23,6 @@ def prob_ST_above_x(S, x, T, r, sigma):
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
 
-# ---------- helpers ----------
 def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
 
 def fetch_hist(symbol: str, days=200):
@@ -51,8 +50,8 @@ def compute_trend(symbol: str):
     score = 0.0; notes=[]
     if ema20.iloc[-1] > ema50.iloc[-1]: score += 0.4; notes.append("EMA20 > EMA50 (uptrend).")
     else: notes.append("EMA20 ≤ EMA50 (not an uptrend).")
-    if ret10 > 0: score += 0.3; notes.append(f"10‑day momentum +{ret10*100:.1f}%.")
-    else: notes.append(f"10‑day momentum {ret10*100:.1f}%.")
+    if ret10 > 0: score += 0.3; notes.append(f"10-day momentum +{ret10*100:.1f}%.")
+    else: notes.append(f"10-day momentum {ret10*100:.1f}%.")
     score += 0.3 * max(0.0, 1.0 - abs(rsi_val-50)/50)
     notes.append(f"RSI(14) ≈ {rsi_val:.1f}.")
     trend = "up" if score >= 0.55 else ("down" if score <= 0.35 else "neutral")
@@ -134,7 +133,7 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
 def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
-    """Only yfinance; never calls Yahoo v7 APIs."""
+    """Only yfinance; skip malformed expiries safely."""
     symbol = symbol.upper().strip()
     if yf is None:
         return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
@@ -147,8 +146,10 @@ def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
             try:
                 d=dt.date.fromisoformat(e); dte=(d-today).days
                 if dte_lo <= dte <= dte_hi: valid.append((d,e,dte))
-            except Exception: continue
-        # price
+            except Exception: 
+                continue
+
+        # Underlying price
         S=None
         try:
             info=tkr.fast_info; S=float(info.get("last_price"))
@@ -161,13 +162,14 @@ def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
         chains=[]
         for _,e_str,dte in valid:
             try:
-                oc=tkr.option_chain(e_str)
+                oc=tkr.option_chain(e_str)   # <-- sometimes raises JSONDecodeError; we catch it
                 calls=oc.calls.to_dict(orient="records")
                 puts= oc.puts.to_dict(orient="records")
                 chains.append({"expiry":e_str,"dte":dte,"calls":calls,"puts":puts})
             except Exception:
+                # skip bad expiry instead of failing whole endpoint
                 continue
-        note = None if chains else f"No option chain in {dte_lo}–{dte_hi} DTE."
+        note = None if chains else f"No usable option chains in {dte_lo}–{dte_hi} DTE."
         return {"price": S, "expiries": [e for _,e,_ in valid], "chains": chains, "note": note}
     except Exception as ex:
         return {"price": None, "expiries": [], "chains": [], "note": f"yfinance error: {type(ex).__name__}"}
@@ -176,7 +178,7 @@ def load_chain_multiwindow(symbol: str):
     """Try 21–45 (preferred), then 14–60, then 30–90 DTE."""
     for lo,hi in [(21,45),(14,60),(30,90)]:
         book = _load_chain_yf(symbol, lo, hi)
-        if book.get("chains"): 
+        if book.get("chains"):
             book["picked_window"] = (lo,hi)
             return book
         last = book
