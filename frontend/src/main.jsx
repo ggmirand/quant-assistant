@@ -1,7 +1,7 @@
 import React, {useEffect, useMemo, useState, useRef} from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
-import { SectorBar, GainersBar, Histogram } from './charts.jsx'
+import { SectorBar, GainersBar } from './charts.jsx'
 import PriceVolume from './PriceVolume.jsx'
 import PayoffChart from './PayoffChart.jsx'
 import Glossary from './Glossary.jsx'
@@ -152,10 +152,6 @@ function App(){
     </div>},
     {key:'closes', label:'Spark', render:(v,r)=> <Sparkline data={r.closes} width={100} height={26} title={`${r.symbol} recent closes`} />},
   ]
-  const scanRows = useMemo(()=>{
-    const rows = scan?.results || []
-    return [...rows].sort((a,b)=> (b.score ?? 0) - (a.score ?? 0))
-  },[scan?.results])
 
   // Options (best trades) with auto-refresh
   const [optSymbol,setOptSymbol]=useState("AAPL")
@@ -189,6 +185,15 @@ function App(){
   }
   useEffect(()=>{ runOptions() },[]) // initial
   useAutoRefresh(runOptions, optEvery, optAuto)
+
+  // Backoff when rate-limited (429)
+  useEffect(()=>{
+    if (opt?.note && /429|rate limited/i.test(String(opt.note))) {
+      setOptEvery(60000);
+      const t = setTimeout(()=> setOptEvery(15000), 60_000);
+      return ()=> clearTimeout(t);
+    }
+  }, [opt?.note]);
 
   function itmBadge(row){
     if (!underPrice || !row) return null
@@ -231,9 +236,8 @@ function App(){
       : `This is a PUT. You pay ${formatMoney(premium)} now. If the stock ends below $${strike.toFixed(2)} at expiry, it’s “in the money.” Finishing below the strike has chance ≈ ${isNaN(probITM)?'—':((1-probITM)*100).toFixed(1)+'%'}. Your breakeven is $${breakeven.toFixed(2)} (below).`
     return { premium, strike, type, breakeven, greeks, probTxt, payoff, summary }
   }
-  const optInfo = optionAnalysis(optSelected || (opt?.candidates?.[0] ?? null))
 
-  // Portfolio suggestions (auto-refresh)
+  // Portfolio suggestions (auto-refresh + backoff)
   const [pfJSON, setPfJSON] = useState(JSON.stringify({
     buying_power: 3000,
     goal: "directional",
@@ -257,6 +261,17 @@ function App(){
   }
   useEffect(()=>{ runPortfolio() },[]) // initial
   useAutoRefresh(runPortfolio, pfEvery, pfAuto)
+
+  useEffect(()=>{
+    if (pfResp?.note && /429|rate limited/i.test(String(pfResp.note))) {
+      setPfEvery(60000);
+      const t = setTimeout(()=> setPfEvery(15000), 60_000);
+      return ()=> clearTimeout(t);
+    }
+  }, [pfResp?.note]);
+
+  // UI helpers
+  const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
 
   return (
     <div className="container">
@@ -304,7 +319,7 @@ function App(){
         {scanErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(scanErr)}</div>}
         <Table
           caption="Ranked by composite score (desc)"
-          rows={(scan?.results||[]).sort((a,b)=> (b.score??0)-(a.score??0))}
+          rows={scanRows}
           columns={scanCols}
           onRowClick={setSelected}
           getRowKey={(r)=>r.symbol}
@@ -362,8 +377,15 @@ function App(){
             </div>
           </div>
         </form>
-        {underPrice && <div className="help" style={{marginBottom:8}}>Underlying price (approx): <b>${underPrice.toFixed(2)}</b></div>}
-        {optErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(optErr)}</div>}
+
+        {/* Show provider/rate-limit note prominently */}
+        {opt?.note && (
+          <div role="alert" className="help" style={{color:'var(--danger)', marginBottom:8}}>
+            {String(opt.note)}
+          </div>
+        )}
+
+        {/* Candidates table */}
         <Table
           caption="Click a row to analyze"
           rows={opt?.candidates || []}
@@ -372,47 +394,39 @@ function App(){
           getRowKey={(r)=>`${r.expiry}-${r.type}-${r.strike}`}
           getRowActive={(r)=> optSelected && r.expiry===optSelected.expiry && r.type===optSelected.type && r.strike===optSelected.strike}
         />
-        {optSelected && underPrice && (
-          <div className="panel" style={{marginTop:12}}>
-            <div className="row">
-              <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
-                <div style={{fontWeight:600, marginBottom:6}}>Contract analysis</div>
-                {(() => {
-                  const i = optionAnalysis(optSelected)
-                  return i ? (
-                    <>
-                      <div className="help">Type: <b>{i.type}</b> | Strike: <b>${i.strike.toFixed(2)}</b> | Premium: <b>{i.premium.toFixed(2)}</b></div>
-                      <div className="help">Breakeven (expiry): <b>${i.breakeven.toFixed(2)}</b></div>
-                      <div className="help">Greeks/IV: <b>{i.greeks}</b></div>
-                      <div className="help">Prob. finish in‑the‑money: <b>{i.probTxt}</b></div>
-                      <div className="help">Payoff: {i.payoff}</div>
-                    </>
-                  ) : <div className="help">Select an option to see details.</div>
-                })()}
-              </div>
-              <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
-                <div style={{fontWeight:600, marginBottom:6}}>Plain‑English summary</div>
-                {(() => {
-                  const i = optionAnalysis(optSelected)
-                  return i ? <div className="help">
+
+        {/* Analysis + Payoff */}
+        {(() => {
+          const c = optSelected || (opt?.candidates?.[0] ?? null)
+          if (!c || !underPrice) return null
+          const i = optionAnalysis(c)
+          return (
+            <div className="panel" style={{marginTop:12}}>
+              <div className="row">
+                <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
+                  <div style={{fontWeight:600, marginBottom:6}}>Contract analysis</div>
+                  <div className="help">Type: <b>{i.type}</b> | Strike: <b>${i.strike.toFixed(2)}</b> | Premium: <b>{i.premium.toFixed(2)}</b></div>
+                  <div className="help">Breakeven (expiry): <b>${i.breakeven.toFixed(2)}</b></div>
+                  <div className="help">Greeks/IV: <b>{i.greeks}</b></div>
+                  <div className="help">Prob. finish in‑the‑money: <b>{i.probTxt}</b></div>
+                  <div className="help">Payoff: {i.payoff}</div>
+                </div>
+                <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
+                  <div style={{fontWeight:600, marginBottom:6}}>Plain‑English summary</div>
+                  <div className="help">
                     {i.summary}
                     <div style={{marginTop:6}}>
                       <i>In short:</i> You risk about <b>${i.premium.toFixed(2)}</b>. Breakeven at expiry is <b>${i.breakeven.toFixed(2)}</b>. Probabilities are estimates.
                     </div>
-                  </div> : <div className="help">Select an option to see a simple explanation.</div>
-                })()}
+                  </div>
+                </div>
               </div>
+              <h3 style={{marginTop:12, marginBottom:8}}>Payoff at expiry</h3>
+              <div className="help" style={{marginBottom:6}}>Profit/Loss for a single long {String(c.type).toUpperCase()} at different stock prices on expiry.</div>
+              <PayoffChart s0={underPrice} type={String(c.type).toUpperCase()} strike={Number(c.strike)} premium={Number(c.mid_price||0)} />
             </div>
-            <h3 style={{marginTop:12, marginBottom:8}}>Payoff at expiry</h3>
-            <div className="help" style={{marginBottom:6}}>Profit/Loss for a single long {String(optSelected.type).toUpperCase()} at different stock prices on expiry.</div>
-            <PayoffChart
-              s0={underPrice}
-              type={String(optSelected.type).toUpperCase()}
-              strike={Number(optSelected.strike)}
-              premium={Number(optSelected.mid_price||0)}
-            />
-          </div>
-        )}
+          )
+        })()}
       </Panel>
 
       {/* PORTFOLIO SUGGESTIONS (NEW) */}
@@ -436,21 +450,34 @@ function App(){
             </div>
           </div>
         </form>
-        {pfErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(pfErr)}</div>}
+
+        {/* Provider/rate-limit note */}
+        {pfResp?.note && (
+          <div role="alert" className="help" style={{color:'var(--danger)', marginBottom:8}}>
+            {String(pfResp.note)}
+          </div>
+        )}
+
         {(pfResp?.suggestions||[]).length ? (
           <div className="row">
             {pfResp.suggestions.map((sug,i)=>(
               <div key={i} className="card" style={{flex:'1 1 340px', minWidth:300}}>
                 <div style={{fontWeight:600, marginBottom:6}}>{sug.symbol}</div>
-                <div className="help">Underlying: <b>${Number(sug.under_price).toFixed(2)}</b></div>
-                <div className="help">Idea: <b>{sug.suggestion.type}</b> {sug.suggestion.expiry} @ ${Number(sug.suggestion.strike).toFixed(2)} (premium ~ ${Number(sug.suggestion.mid_price).toFixed(2)})</div>
-                <div className="help">Breakeven: <b>${Number(sug.suggestion.breakeven).toFixed(2)}</b> | Cost (1x): <b>${Number(sug.cost_estimate).toFixed(2)}</b></div>
-                {sug.sim && <div className="help">Sim P/L — P5: <b>${sug.sim.pl_p5.toFixed(2)}</b> | Median: <b>${sug.sim.pl_p50.toFixed(2)}</b> | P95: <b>${sug.sim.pl_p95.toFixed(2)}</b> | P(profit): <b>{(sug.sim.prob_profit*100).toFixed(1)}%</b></div>}
-                <div className="help" style={{marginTop:6}}>Reasoning:</div>
-                <ul className="help" style={{marginTop:4}}>
-                  {sug.reasoning.map((t,j)=><li key={j}>{t}</li>)}
-                </ul>
-                <div className="help" style={{marginTop:6}}>{sug.note}</div>
+                {sug.suggestion ? (
+                  <>
+                    <div className="help">Underlying: <b>${Number(sug.under_price).toFixed(2)}</b></div>
+                    <div className="help">Idea: <b>{sug.suggestion.type}</b> {sug.suggestion.expiry} @ ${Number(sug.suggestion.strike).toFixed(2)} (premium ~ ${Number(sug.suggestion.mid_price).toFixed(2)})</div>
+                    <div className="help">Breakeven: <b>${Number(sug.suggestion.breakeven).toFixed(2)}</b> | Cost (1x): <b>${Number(sug.cost_estimate).toFixed(2)}</b></div>
+                    {sug.sim && <div className="help">Sim P/L — P5: <b>${sug.sim.pl_p5.toFixed(2)}</b> | Median: <b>${sug.sim.pl_p50.toFixed(2)}</b> | P95: <b>${sug.sim.pl_p95.toFixed(2)}</b> | P(profit): <b>{(sug.sim.prob_profit*100).toFixed(1)}%</b></div>}
+                    <div className="help" style={{marginTop:6}}>Reasoning:</div>
+                    <ul className="help" style={{marginTop:4}}>
+                      {(sug.reasoning||[]).map((t,j)=><li key={j}>{t}</li>)}
+                    </ul>
+                    <div className="help" style={{marginTop:6}}>{sug.note}</div>
+                  </>
+                ) : (
+                  <div className="help">{sug.note || 'No suggestion available right now.'}</div>
+                )}
               </div>
             ))}
           </div>
