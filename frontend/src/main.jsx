@@ -94,7 +94,6 @@ function SuggestionCard({sug}){
 }
 
 function App(){
-  // API status
   const [apiOk,setApiOk]=useState(null)
   useEffect(()=>{ fetch("http://localhost:8000/health").then(r=>r.json()).then(()=>setApiOk(true)).catch(()=>setApiOk(false)) },[])
 
@@ -121,7 +120,6 @@ function App(){
     ticker: x.ticker, price: x.price, change: x.change_percentage
   })), [gainers])
 
-  // Sector click-through
   const [pickedSector, setPickedSector] = useState(null)
   const [bp, setBP] = useState(3000)
   const [sectorIdeas, setSectorIdeas] = useState(null)
@@ -166,7 +164,7 @@ function App(){
       if (j.note) setScanNote(j.note)
     }catch(e){ setScanNote(String(e)) }
   }
-  useEffect(()=>{ runScan() },[]) // auto-run once so you see data
+  useEffect(()=>{ runScan() },[])
 
   const scanCols = [
     {key:'symbol',label:'Symbol'},
@@ -180,7 +178,7 @@ function App(){
   ]
   const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
 
-  // My Ticker (Options)
+  // My Ticker
   const [mySym,setMySym]=useState("AAPL")
   const [myBP,setMyBP]=useState(5000)
   const [myIdea,setMyIdea]=useState(null)
@@ -211,7 +209,6 @@ function App(){
         This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
       </div>
 
-      {/* MARKET */}
       <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 ideas + insight + headlines.">
         {mhNote && <div role="alert" className="help" style={{color:'var(--danger)'}}>{mhNote}</div>}
         <div className="row">
@@ -255,7 +252,6 @@ function App(){
         )}
       </Panel>
 
-      {/* QUICK SCREENER */}
       <Panel id="screener" title="Quick Screener" desc="Type tickers, run, then click a row to see details.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();runScan()}}>
           <div className="input" style={{flex:'1 1 520px'}}>
@@ -299,8 +295,7 @@ function App(){
         </div>
       </Panel>
 
-      {/* MY TICKER (Options via yfinance only) */}
-      <Panel id="myticker" title="Options — My Ticker (single scan)" desc="We pick one contract using liquidity, Δ≈0.30, DTE 21–45, affordability, and trend alignment.">
+      <Panel id="myticker" title="Options — My Ticker (single scan)" desc="We pick one contract using liquidity, Δ≈0.30, DTE 21–45 (fallbacks 14–60, 30–90), affordability, and trend alignment.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();fetchMyIdea()}}>
           <div className="input">
             <label htmlFor="mysym">Symbol</label>
@@ -316,6 +311,7 @@ function App(){
         </form>
         {myErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(myErr)}</div>}
         {myIdea?.note && <div className="help" style={{color:'var(--danger)'}}>{String(myIdea.note)}</div>}
+        {myIdea?.picked_window && <div className="help">Used DTE window: <b>{myIdea.picked_window[0]}–{myIdea.picked_window[1]}</b> days</div>}
         {myIdea?.suggestion ? <SuggestionCard sug={myIdea}/> : <div className="help" style={{marginTop:8}}>No suggestion yet.</div>}
       </Panel>
 
