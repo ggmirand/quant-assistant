@@ -16,45 +16,89 @@ const baseOpts = {
   }
 }
 
-export function SectorBar({rows=[]}) {
+export function SectorBar({rows = []}) {
   const labels = rows.map(r => r.sector)
   const data = {
     labels,
-    datasets: [{ label: '% Change', data: rows.map(r => r.change),
-      borderColor: '#00c805', backgroundColor: 'rgba(0,200,5,0.35)' }]
+    datasets: [{
+      label: '% Change',
+      data: rows.map(r => r.change),
+      borderColor: '#00c805',
+      backgroundColor: 'rgba(0,200,5,0.35)'
+    }]
   }
-  return <Bar data={data} options={{
-    ...baseOpts,
-    plugins: { ...baseOpts.plugins, tooltip: { callbacks: { label: c => `${(c.parsed.y||0).toFixed(2)}%` } } }
-  }}/>
+  return (
+    <Bar
+      data={data}
+      options={{
+        ...baseOpts,
+        plugins: {
+          ...baseOpts.plugins,
+          tooltip: { callbacks: { label: c => `${(c.parsed.y || 0).toFixed(2)}%` } }
+        }
+      }}
+    />
+  )
 }
 
-export function GainersBar({rows=[]}) {
+export function GainersBar({rows = []}) {
   const labels = rows.map(r => r.ticker)
-  const nums = rows.map(r => parseFloat(String(r.change||'').replace('%','')) || 0)
-  const data = { labels, datasets: [{ label: '% Change', data: nums,
-    borderColor: '#60a5fa', backgroundColor: 'rgba(96,165,250,0.35)' }] }
-  return <Bar data={data} options={{
-    ...baseOpts,
-    plugins: { ...baseOpts.plugins, tooltip: { callbacks: { label: c => `${(c.parsed.y||0).toFixed(2)}%` } } }
-  }}/>
+  const nums = rows.map(r => parseFloat(String(r.change || '').replace('%', '')) || 0)
+  const data = {
+    labels,
+    datasets: [{
+      label: '% Change',
+      data: nums,
+      borderColor: '#60a5fa',
+      backgroundColor: 'rgba(96,165,250,0.35)'
+    }]
+  }
+  return (
+    <Bar
+      data={data}
+      options={{
+        ...baseOpts,
+        plugins: {
+          ...baseOpts.plugins,
+          tooltip: { callbacks: { label: c => `${(c.parsed.y || 0).toFixed(2)}%` } }
+        }
+      }}
+    />
+  )
 }
 
-export function Histogram({values=[], bins=20, color='#eab308', title='Histogram'}) {
+export function Histogram({values = [], bins = 20, color = '#eab308', title = 'Histogram'}) {
   if (!values?.length) return <div className="help">No data</div>
   const min = Math.min(...values), max = Math.max(...values)
-  const width = (max - min) || 1, step = width / bins
-  const edges = Array.from({length: bins}, (_,i)=> min + i*step)
-  const counts = Array.from({length: bins}, ()=>0)
+  const width = (max - min) || 1
+  const step = width / bins
+  const edges = Array.from({length: bins}, (_, i) => min + i * step)
+  const counts = Array.from({length: bins}, () => 0)
+
   for (const v of values) {
-    let idx = Math.floor((v - min)/step)
-    if (idx >= bins) idx = bins-1
+    let idx = Math.floor((v - min) / step)
+    if (idx >= bins) idx = bins - 1
     if (idx < 0) idx = 0
     counts[idx]++
   }
-  const labels = edges.map((e,i)=> i===0 ? e.toFixed(2) : '')
-  const data = { labels, datasets: [{ label: title, data: counts, borderColor: color, backgroundColor: `${color}55` }] }
-  return <Bar data={data} options={{ ...baseOpts, plugins: { ...baseOpts.plugins, legend:{display:false} }}}/>
-}
-plugins: { ...baseOpts.plugins, legend:{display:false} }}}/>
+
+  const labels = edges.map((e, i) => (i === 0 ? e.toFixed(2) : ''))
+  const data = {
+    labels,
+    datasets: [{
+      label: title,
+      data: counts,
+      borderColor: color,
+      backgroundColor: `${color}55`
+    }]
+  }
+  return (
+    <Bar
+      data={data}
+      options={{
+        ...baseOpts,
+        plugins: { ...baseOpts.plugins, legend: { display: false } }
+      }}
+    />
+  )
 }
