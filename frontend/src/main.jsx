@@ -1,12 +1,10 @@
-import React, {useEffect, useMemo, useState} from 'react'
+import React, {useEffect, useMemo, useState, useRef} from 'react'
 import { createRoot } from 'react-dom/client'
 import './style.css'
 import { SectorBar, GainersBar, Histogram } from './charts.jsx'
 import PriceVolume from './PriceVolume.jsx'
 import PayoffChart from './PayoffChart.jsx'
 import Glossary from './Glossary.jsx'
-
-
 
 const Panel = ({title, children, desc, id}) => (
   <section className="panel" aria-labelledby={id}>
@@ -53,7 +51,6 @@ function Table({rows, columns, caption, onRowClick, getRowKey, getRowActive}){
   )
 }
 
-// Tiny inline sparkline
 function Sparkline({data=[], width=100, height=26, color='var(--accent)', strokeWidth=2, title='Sparkline'}){
   if (!data || data.length < 2) return <span className="help">—</span>
   const min = Math.min(...data), max = Math.max(...data)
@@ -92,6 +89,16 @@ function DarkModeToggle(){
   </button>
 }
 
+function useAutoRefresh(callback, delayMs, enabled){
+  const savedCb = useRef(()=>{})
+  useEffect(()=>{ savedCb.current = callback }, [callback])
+  useEffect(()=>{
+    if (!enabled || !delayMs || delayMs < 1000) return
+    const id = setInterval(()=> savedCb.current(), delayMs)
+    return ()=> clearInterval(id)
+  },[delayMs, enabled])
+}
+
 function App(){
   // API status
   const [apiOk,setApiOk]=useState(null)
@@ -113,7 +120,7 @@ function App(){
     ticker: x.ticker, price: x.price, change: x.change_percentage
   })), [movers.data])
 
-  // Screener (180d history for chart)
+  // Screener
   const [symbols,setSymbols]=useState("AAPL,MSFT,NVDA,TSLA,AMZN")
   const [scan,setScan]=useState(null); const [scanErr,setScanErr]=useState(null); const [scanLoad,setScanLoad]=useState(false)
   const [selected,setSelected]=useState(null)
@@ -128,6 +135,7 @@ function App(){
       const r=await fetch(u); setScan(await r.json()); setSelected(null)
     }catch(e){ setScanErr(String(e)) } finally { setScanLoad(false) }
   }
+
   const scanCols = [
     {key:'symbol', label:'Symbol'},
     {key:'score', label:'Score'},
@@ -149,14 +157,15 @@ function App(){
     return [...rows].sort((a,b)=> (b.score ?? 0) - (a.score ?? 0))
   },[scan?.results])
 
-  // Options
+  // Options (best trades) with auto-refresh
   const [optSymbol,setOptSymbol]=useState("AAPL")
   const [buying,setBuying]=useState(5000)
   const [opt,setOpt]=useState(null); const [optErr,setOptErr]=useState(null); const [optLoad,setOptLoad]=useState(false)
   const [optSelected, setOptSelected] = useState(null)
   const [underPrice, setUnderPrice] = useState(null)
+  const [optAuto, setOptAuto] = useState(true)
+  const [optEvery, setOptEvery] = useState(15000) // ms
 
-  // helper: fetch latest price for options symbol (reuses screener API)
   async function fetchUnderlyingPrice(sym){
     try{
       const u=new URL("http://localhost:8000/api/screener/scan")
@@ -167,19 +176,20 @@ function App(){
       if (first && isFinite(first.price)) setUnderPrice(Number(first.price))
     }catch(_) {}
   }
-
   const runOptions=async()=>{
-    setOptErr(null); setOpt(null); setOptSelected(null); setUnderPrice(null); setOptLoad(true)
+    setOptErr(null); setOptLoad(true)
     try{
       const u=new URL("http://localhost:8000/api/options/best-trades")
       u.searchParams.set("symbol",optSymbol)
       u.searchParams.set("buying_power", String(buying))
       const r=await fetch(u); const j=await r.json(); setOpt(j)
       fetchUnderlyingPrice(optSymbol)
+      setOptSelected(null)
     }catch(e){ setOptErr(String(e)) } finally { setOptLoad(false) }
   }
+  useEffect(()=>{ runOptions() },[]) // initial
+  useAutoRefresh(runOptions, optEvery, optAuto)
 
-  // ITM/OTM label
   function itmBadge(row){
     if (!underPrice || !row) return null
     const isCall = String(row.type).toUpperCase()==='CALL'
@@ -191,18 +201,16 @@ function App(){
       marginLeft:6, fontSize:12
     }}>{itm?'ITM':'OTM'}</span>
   }
-
   const optCols = [
     {key:'expiry', label:'Expiry'},
     {key:'type', label:'Type', render:(v,r)=> <>{v}{itmBadge(r)}</>},
     {key:'strike', label:'Strike', render:v=>Number(v).toFixed(2)},
-    {key:'delta', label:'Delta', render:v=>Number(v).toFixed(2)},
+    {key:'mid_price', label:'Premium', render:v=>Number(v||0).toFixed(2)},
+    {key:'delta', label:'Delta', render:v=> (v==null?'—':Number(v).toFixed(2))},
     {key:'iv', label:'IV', render:v=> (Number(v)*100).toFixed(1)+"%"},
     {key:'prob_finish_above_strike', label:'P(Sₜ>K)', render:v=> isNaN(v)? '—' : (Number(v)*100).toFixed(1)+"%"},
-    {key:'mid_price', label:'Premium', render:v=>Number(v||0).toFixed(2)},
+    {key:'breakeven', label:'Breakeven', render:v=> Number(v).toFixed(2)},
   ]
-
-  // Options analysis helpers (no personal advice)
   function formatMoney(n){ return isFinite(n) ? `$${Number(n).toFixed(2)}` : '—' }
   function optionAnalysis(c){
     if(!c) return null
@@ -212,61 +220,47 @@ function App(){
     const probITM = isFinite(c.prob_finish_above_strike) ? Number(c.prob_finish_above_strike) : NaN
     const delta   = isFinite(c.delta) ? Number(c.delta) : NaN
     const iv      = isFinite(c.iv) ? Number(c.iv) : NaN
-    const breakeven = type === 'CALL' ? strike + premium : strike - premium
+    const breakeven = Number(c.breakeven|| (type==='CALL' ? strike + premium : strike - premium))
     const greeks = `Δ=${isNaN(delta)?'—':delta.toFixed(2)}  |  IV=${isNaN(iv)?'—':(iv*100).toFixed(1)}%`
     const probTxt = isNaN(probITM) ? '—' : `${(probITM*100).toFixed(1)}%`
     const payoff = type === 'CALL'
       ? `Max gain: unlimited above strike; Max loss: premium (${formatMoney(premium)}).`
       : `Max gain: strike − premium if stock goes to $0; Max loss: premium (${formatMoney(premium)}).`
     const summary = type === 'CALL'
-      ? `This is a CALL. You pay ${formatMoney(premium)} now. If the stock ends above $${strike.toFixed(2)} on expiry, it’s “in the money.” The model’s chance of that is ${probTxt}. You break even if it ends above $${breakeven.toFixed(2)}.`
-      : `This is a PUT. You pay ${formatMoney(premium)} now. If the stock ends below $${strike.toFixed(2)} on expiry, it’s “in the money.” If the shown probability was P(finish above strike), then finishing below has chance ≈ ${isNaN(probITM)?'—':((1-probITM)*100).toFixed(1)+'%'}. Your breakeven is $${breakeven.toFixed(2)} (below).`
+      ? `This is a CALL. You pay ${formatMoney(premium)} now. If the stock ends above $${strike.toFixed(2)} at expiry, it’s “in the money.” The model’s chance of that is ${probTxt}. You break even if it ends above $${breakeven.toFixed(2)}.`
+      : `This is a PUT. You pay ${formatMoney(premium)} now. If the stock ends below $${strike.toFixed(2)} at expiry, it’s “in the money.” Finishing below the strike has chance ≈ ${isNaN(probITM)?'—':((1-probITM)*100).toFixed(1)+'%'}. Your breakeven is $${breakeven.toFixed(2)} (below).`
     return { premium, strike, type, breakeven, greeks, probTxt, payoff, summary }
   }
   const optInfo = optionAnalysis(optSelected || (opt?.candidates?.[0] ?? null))
 
-  // Feedback generator (simple rule-based, 8th-grade tone; no personal advice)
-  const [feedbackText, setFeedbackText] = useState('')
-  function generateFeedback(){
-    const parts = []
-    // Stock context (from selected screener row)
-    if (selected){
-      const trend = selected?.signals?.trend_up ? 'uptrend' : 'downtrend'
-      parts.push(`${selected.symbol}: The price is ${trend} based on EMA(12/26). RSI is ${Number(selected.rsi).toFixed(1)}, which hints at ${selected.rsi>=70?'hot/overbought':selected.rsi<=30?'cool/oversold':'normal'} conditions. Volume looks ${((selected.volume_rank_pct||0)*100).toFixed(0)}th percentile in your list. Overall score: ${selected.score}/100.`)
-    }
-    // Option context (selected option candidate)
-    if (optInfo){
-      const itmLabel = underPrice && optSelected
-        ? ((String(optSelected.type).toUpperCase()==='CALL' ? underPrice>optSelected.strike : underPrice<optSelected.strike) ? 'ITM' : 'OTM')
-        : '—'
-      parts.push(`Option: ${optInfo.type} ${optSelected?optSelected.expiry:''} @ $${optInfo.strike.toFixed(2)}. Premium about ${formatMoney(optInfo.premium)}. Breakeven near $${optInfo.breakeven.toFixed(2)}. Δ and IV: ${optInfo.greeks}. Status: ${itmLabel}.`)
-      parts.push(`Plain meaning: This option could make money if the stock moves in the expected direction enough by expiry. Your worst-case loss is the premium you pay. This is just a learning example, not advice.`)
-    }
-    setFeedbackText(parts.join(' '))
-  }
+  // Portfolio suggestions (auto-refresh)
+  const [pfJSON, setPfJSON] = useState(JSON.stringify({
+    buying_power: 3000,
+    goal: "directional",
+    positions: [{symbol:"AAPL", shares: 12}, {symbol:"MSFT", shares: 5}]
+  }, null, 2))
+  const [pfResp, setPfResp] = useState(null)
+  const [pfErr, setPfErr] = useState(null)
+  const [pfLoad, setPfLoad] = useState(false)
+  const [pfAuto, setPfAuto] = useState(true)
+  const [pfEvery, setPfEvery] = useState(15000)
 
-  // Monte Carlo
-  const [mcSymbol,setMcSymbol]=useState("AAPL")
-  const [mcDays,setMcDays]=useState(30)
-  const [mcPaths,setMcPaths]=useState(2000)
-  const [mcBarrier,setMcBarrier]=useState("")
-  const [mc,setMc]=useState(null); const [mcErr,setMcErr]=useState(null); const [mcLoad,setMcLoad]=useState(false)
-  const runMC=async()=>{
-    setMc(null); setMcErr(null); setMcLoad(true)
+  const runPortfolio=async()=>{
+    setPfErr(null); setPfLoad(true)
     try{
-      const body = { symbol: mcSymbol, days: Number(mcDays), n_paths: Number(mcPaths) }
-      if (mcBarrier !== "") body.barrier = Number(mcBarrier)
-      const r = await fetch("http://localhost:8000/api/simulator/monte-carlo", {
-        method:"POST", headers:{"Content-Type":"application/json"}, body: JSON.stringify(body)
+      const r = await fetch("http://localhost:8000/api/options/portfolio-suggestions", {
+        method:"POST", headers:{"Content-Type":"application/json"}, body: pfJSON
       })
-      setMc(await r.json())
-    }catch(e){ setMcErr(String(e)) } finally { setMcLoad(false) }
+      const j = await r.json()
+      setPfResp(j)
+    }catch(e){ setPfErr(String(e)) } finally { setPfLoad(false) }
   }
-  const mcValues = mc?.terminal_prices || []
+  useEffect(()=>{ runPortfolio() },[]) // initial
+  useAutoRefresh(runPortfolio, pfEvery, pfAuto)
 
   return (
     <div className="container">
-      <header className="header" role="banner" aria-label="App header">
+      <header className="header">
         <div style={{display:'flex', gap:10, alignItems:'center'}}>
           <h2 style={{margin:0}}>Quant Assistant</h2>
           <span className="badge" aria-live="polite">
@@ -277,10 +271,10 @@ function App(){
         <DarkModeToggle />
       </header>
       <div className="help" style={{marginBottom:12}}>
-        This dashboard is for education only — not financial advice.
+        This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
       </div>
 
-      {/* MARKET HIGHLIGHTS */}
+      {/* MARKET */}
       <Panel id="highlights" title="Market Highlights" desc="Top sectors & highest‑performing stocks (% change).">
         <div className="row">
           <div style={{flex:'1 1 420px', minWidth:320}}>
@@ -310,7 +304,7 @@ function App(){
         {scanErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(scanErr)}</div>}
         <Table
           caption="Ranked by composite score (desc)"
-          rows={scanRows}
+          rows={(scan?.results||[]).sort((a,b)=> (b.score??0)-(a.score??0))}
           columns={scanCols}
           onRowClick={setSelected}
           getRowKey={(r)=>r.symbol}
@@ -336,12 +330,6 @@ function App(){
                 <div className="help">EMA(12) / EMA(26): <b>{Number(selected.ema_short).toFixed(2)}</b> / <b>{Number(selected.ema_long).toFixed(2)}</b></div>
                 <div className="help">5‑day return: <b>{isNaN(selected.mom_5d)?'—':(Number(selected.mom_5d)*100).toFixed(1)+'%'}</b></div>
                 <div className="help">Volume rank: <b>{(Number(selected.volume_rank_pct)*100).toFixed(0)}%</b></div>
-                <div className="help">Signals:
-                  {selected.signals.trend_up && <span style={{color:'var(--ok)'}}> Trend↑</span>}
-                  {selected.signals.oversold && <span style={{color:'#0ea5e9'}}> Oversold</span>}
-                  {selected.signals.overbought && <span style={{color:'var(--danger)'}}> Overbought</span>}
-                  {selected.signals.meets_min_volume && <span> Vol✓</span>}
-                </div>
               </div>
             </div>
           </div>
@@ -350,68 +338,73 @@ function App(){
         )}
       </Panel>
 
-      {/* OPTIONS */}
-      <Panel id="options" title="Options — Best Trades (delta‑targeted)" desc="Targets ~0.25 |delta| ≤45 days; shows risk‑neutral probability of finishing above strike (N(d₂)).">
+      {/* OPTIONS — Best trades */}
+      <Panel id="options" title="Options — Best Trades (real chain, live)" desc="Real expiries/strikes via yfinance; ~0.25 |delta| within 7–45 DTE.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();runOptions()}}>
           <div className="input">
             <label htmlFor="optSymbol">Symbol</label>
-            <input id="optSymbol" name="optSymbol" value={optSymbol} onChange={e=>setOptSymbol(e.target.value.toUpperCase())} placeholder="AAPL"/>
+            <input id="optSymbol" value={optSymbol} onChange={e=>setOptSymbol(e.target.value.toUpperCase())} />
           </div>
           <div className="input">
             <label htmlFor="buying">Buying power ($)</label>
-            <input id="buying" name="buying" inputMode="numeric" type="number" min="0" value={buying} onChange={e=>setBuying(e.target.value)} placeholder="5000"/>
+            <input id="buying" inputMode="numeric" type="number" min="0" value={buying} onChange={e=>setBuying(e.target.value)} />
           </div>
           <div className="input">
             <label htmlFor="opt-btn" className="sr-only">Find</label>
             <button id="opt-btn" type="submit" className="button">{optLoad? 'Finding…' : 'Find'}</button>
           </div>
+          <div className="input">
+            <label>Auto</label>
+            <div style={{display:'flex', gap:8, alignItems:'center'}}>
+              <input type="checkbox" checked={optAuto} onChange={e=>setOptAuto(e.target.checked)} />
+              <input type="number" min="5" step="5" value={Math.round(optEvery/1000)} onChange={e=>setOptEvery(Number(e.target.value)*1000)} style={{width:80}}/>
+              <span className="help">sec</span>
+            </div>
+          </div>
         </form>
         {underPrice && <div className="help" style={{marginBottom:8}}>Underlying price (approx): <b>${underPrice.toFixed(2)}</b></div>}
         {optErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(optErr)}</div>}
         <Table
-          caption="Candidate contracts (educational) — click a row"
+          caption="Click a row to analyze"
           rows={opt?.candidates || []}
           columns={optCols}
           onRowClick={setOptSelected}
           getRowKey={(r)=>`${r.expiry}-${r.type}-${r.strike}`}
           getRowActive={(r)=> optSelected && r.expiry===optSelected.expiry && r.type===optSelected.type && r.strike===optSelected.strike}
         />
-
-        {/* Analysis block + Payoff chart */}
-        <div className="row" style={{marginTop:12}}>
-          <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
-            <div style={{fontWeight:600, marginBottom:6}}>Contract analysis</div>
-            {optInfo ? (
-              <>
-                <div className="help">Type: <b>{optInfo.type}</b> &nbsp; | &nbsp; Strike: <b>${optInfo.strike.toFixed(2)}</b> &nbsp; | &nbsp; Premium: <b>{(optInfo.premium).toFixed(2)}</b></div>
-                <div className="help">Breakeven (expiry): <b>${optInfo.breakeven.toFixed(2)}</b></div>
-                <div className="help">Greeks/IV: <b>{optInfo.greeks}</b></div>
-                <div className="help">Prob. finish in‑the‑money: <b>{optInfo.probTxt}</b></div>
-                <div className="help">Payoff: {optInfo.payoff}</div>
-              </>
-            ) : <div className="help">Select an option to see details.</div>}
-          </div>
-
-          <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
-            <div style={{fontWeight:600, marginBottom:6}}>Plain‑English summary</div>
-            {optInfo ? (
-              <div className="help">
-                {optInfo.summary}
-                <div style={{marginTop:6}}>
-                  <i>In short:</i> you’re risking about <b>${(optInfo.premium).toFixed(2)}</b>. Your breakeven at expiry is <b>${optInfo.breakeven.toFixed(2)}</b>. The shown probability is a model estimate, not a guarantee.
-                </div>
-              </div>
-            ) : <div className="help">Select an option to see a simple explanation.</div>}
-          </div>
-        </div>
-
-        {/* Payoff chart */}
         {optSelected && underPrice && (
           <div className="panel" style={{marginTop:12}}>
-            <h3 style={{marginBottom:8}}>Payoff at expiry</h3>
-            <div className="help" style={{marginBottom:6}}>
-              Profit/Loss for a single long {String(optSelected.type).toUpperCase()} at different stock prices on expiry.
+            <div className="row">
+              <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
+                <div style={{fontWeight:600, marginBottom:6}}>Contract analysis</div>
+                {(() => {
+                  const i = optionAnalysis(optSelected)
+                  return i ? (
+                    <>
+                      <div className="help">Type: <b>{i.type}</b> | Strike: <b>${i.strike.toFixed(2)}</b> | Premium: <b>{i.premium.toFixed(2)}</b></div>
+                      <div className="help">Breakeven (expiry): <b>${i.breakeven.toFixed(2)}</b></div>
+                      <div className="help">Greeks/IV: <b>{i.greeks}</b></div>
+                      <div className="help">Prob. finish in‑the‑money: <b>{i.probTxt}</b></div>
+                      <div className="help">Payoff: {i.payoff}</div>
+                    </>
+                  ) : <div className="help">Select an option to see details.</div>
+                })()}
+              </div>
+              <div className="card" style={{flex:'1 1 420px', minWidth:300}}>
+                <div style={{fontWeight:600, marginBottom:6}}>Plain‑English summary</div>
+                {(() => {
+                  const i = optionAnalysis(optSelected)
+                  return i ? <div className="help">
+                    {i.summary}
+                    <div style={{marginTop:6}}>
+                      <i>In short:</i> You risk about <b>${i.premium.toFixed(2)}</b>. Breakeven at expiry is <b>${i.breakeven.toFixed(2)}</b>. Probabilities are estimates.
+                    </div>
+                  </div> : <div className="help">Select an option to see a simple explanation.</div>
+                })()}
+              </div>
             </div>
+            <h3 style={{marginTop:12, marginBottom:8}}>Payoff at expiry</h3>
+            <div className="help" style={{marginBottom:6}}>Profit/Loss for a single long {String(optSelected.type).toUpperCase()} at different stock prices on expiry.</div>
             <PayoffChart
               s0={underPrice}
               type={String(optSelected.type).toUpperCase()}
@@ -422,58 +415,46 @@ function App(){
         )}
       </Panel>
 
-      {/* FEEDBACK GENERATOR */}
-      <Panel id="feedback" title="Feedback Generator" desc="Creates a short, plain‑English summary for learning (not advice).">
-        <div className="row">
+      {/* PORTFOLIO SUGGESTIONS (NEW) */}
+      <Panel id="pf" title="Portfolio Option Suggestions (live, educational)" desc="Paste simple JSON + buying power. Returns 1–3 long-option ideas with quick MC P/L.">
+        <form className="row" onSubmit={(e)=>{e.preventDefault();runPortfolio()}}>
           <div className="input" style={{flex:'1 1 520px'}}>
-            <button className="button" onClick={generateFeedback}>Generate summary from selections</button>
-            <div className="help">Uses the selected stock (from Screener) and/or selected option to write a short explanation in 8th‑grade language.</div>
-          </div>
-        </div>
-        <div className="card">
-          <div style={{whiteSpace:'pre-wrap'}} className="help">{feedbackText || 'Click the button to generate a summary.'}</div>
-        </div>
-        <div className="help" style={{marginTop:8}}>
-          This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
-        </div>
-      </Panel>
-
-      {/* MONTE CARLO */}
-      <Panel id="monte" title="Monte Carlo Simulator" desc="Simulates GBM; histogram shows terminal price distribution.">
-        <form className="row" onSubmit={(e)=>{e.preventDefault(); runMC()}}>
-          <div className="input">
-            <label htmlFor="mcSymbol">Symbol</label>
-            <input id="mcSymbol" name="mcSymbol" value={mcSymbol} onChange={e=>setMcSymbol(e.target.value.toUpperCase())} placeholder="AAPL"/>
+            <label htmlFor="pfjson">Portfolio JSON</label>
+            <textarea id="pfjson" rows={8} style={{width:'100%', background:'#0b141f', color:'var(--text)', border:'1px solid var(--border)', borderRadius:10, padding:10}}
+              value={pfJSON} onChange={e=>setPfJSON(e.target.value)} />
           </div>
           <div className="input">
-            <label htmlFor="mcDays">Horizon (days)</label>
-            <input id="mcDays" name="mcDays" inputMode="numeric" type="number" min="1" value={mcDays} onChange={e=>setMcDays(e.target.value)} />
+            <label className="sr-only" htmlFor="pfBtn">Generate</label>
+            <button id="pfBtn" className="button" type="submit">{pfLoad?'Working…':'Generate'}</button>
           </div>
           <div className="input">
-            <label htmlFor="mcPaths">Paths</label>
-            <input id="mcPaths" name="mcPaths" inputMode="numeric" type="number" min="100" step="100" value={mcPaths} onChange={e=>setMcPaths(e.target.value)} />
-          </div>
-          <div className="input">
-            <label htmlFor="mcBarrier">Barrier (optional)</label>
-            <input id="mcBarrier" name="mcBarrier" inputMode="numeric" type="number" value={mcBarrier} onChange={e=>setMcBarrier(e.target.value)} placeholder="e.g., 220"/>
-          </div>
-          <div className="input">
-            <label htmlFor="mc-btn" className="sr-only">Simulate</label>
-            <button id="mc-btn" type="submit" className="button">{mcLoad? 'Simulating…' : 'Simulate'}</button>
+            <label>Auto</label>
+            <div style={{display:'flex', gap:8, alignItems:'center'}}>
+              <input type="checkbox" checked={pfAuto} onChange={e=>setPfAuto(e.target.checked)} />
+              <input type="number" min="5" step="5" value={Math.round(pfEvery/1000)} onChange={e=>setPfEvery(Number(e.target.value)*1000)} style={{width:80}}/>
+              <span className="help">sec</span>
+            </div>
           </div>
         </form>
-        {mc?.summary
-          ? <>
-              <div className="help" aria-live="polite" style={{marginBottom:8}}>
-                <div>P5: <b>{mc.summary.p5.toFixed(2)}</b> | Median: <b>{mc.summary.p50.toFixed(2)}</b> | P95: <b>{mc.summary.p95.toFixed(2)}</b></div>
-                <div>μ (ann): {(mc.summary.mu_ann*100).toFixed(2)}% | σ (ann): {(mc.summary.sigma_ann*100).toFixed(2)}%</div>
-                {'prob_touch' in mc && <div>Prob. touch: {(mc.prob_touch*100).toFixed(1)}%</div>}
+        {pfErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(pfErr)}</div>}
+        {(pfResp?.suggestions||[]).length ? (
+          <div className="row">
+            {pfResp.suggestions.map((sug,i)=>(
+              <div key={i} className="card" style={{flex:'1 1 340px', minWidth:300}}>
+                <div style={{fontWeight:600, marginBottom:6}}>{sug.symbol}</div>
+                <div className="help">Underlying: <b>${Number(sug.under_price).toFixed(2)}</b></div>
+                <div className="help">Idea: <b>{sug.suggestion.type}</b> {sug.suggestion.expiry} @ ${Number(sug.suggestion.strike).toFixed(2)} (premium ~ ${Number(sug.suggestion.mid_price).toFixed(2)})</div>
+                <div className="help">Breakeven: <b>${Number(sug.suggestion.breakeven).toFixed(2)}</b> | Cost (1x): <b>${Number(sug.cost_estimate).toFixed(2)}</b></div>
+                {sug.sim && <div className="help">Sim P/L — P5: <b>${sug.sim.pl_p5.toFixed(2)}</b> | Median: <b>${sug.sim.pl_p50.toFixed(2)}</b> | P95: <b>${sug.sim.pl_p95.toFixed(2)}</b> | P(profit): <b>{(sug.sim.prob_profit*100).toFixed(1)}%</b></div>}
+                <div className="help" style={{marginTop:6}}>Reasoning:</div>
+                <ul className="help" style={{marginTop:4}}>
+                  {sug.reasoning.map((t,j)=><li key={j}>{t}</li>)}
+                </ul>
+                <div className="help" style={{marginTop:6}}>{sug.note}</div>
               </div>
-              <Histogram values={mcValues} bins={20} title="Terminal prices (count)"/>
-            </>
-          : <div className="help">{mcLoad? 'Running…' : 'Enter inputs and run a simulation.'}</div>
-        }
-        {mcErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(mcErr)}</div>}
+            ))}
+          </div>
+        ) : <div className="help">{pfLoad?'Working…':'Enter portfolio JSON and click Generate.'}</div>}
       </Panel>
 
       <Glossary />
