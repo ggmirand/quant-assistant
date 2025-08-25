@@ -94,6 +94,7 @@ function SuggestionCard({sug}){
 }
 
 function App(){
+  // API health
   const [apiOk,setApiOk]=useState(null)
   useEffect(()=>{ fetch("http://localhost:8000/health").then(r=>r.json()).then(()=>setApiOk(true)).catch(()=>setApiOk(false)) },[])
 
@@ -120,6 +121,7 @@ function App(){
     ticker: x.ticker, price: x.price, change: x.change_percentage
   })), [gainers])
 
+  // Sector drill-down
   const [pickedSector, setPickedSector] = useState(null)
   const [bp, setBP] = useState(3000)
   const [sectorIdeas, setSectorIdeas] = useState(null)
@@ -156,7 +158,7 @@ function App(){
     try{
       const u=new URL("http://localhost:8000/api/screener/scan")
       u.searchParams.set("symbols",symbols)
-      u.searchParams.set("min_volume","1000000")
+      u.searchParams.set("min_volume","0")
       u.searchParams.set("include_history","1")
       u.searchParams.set("history_days","180")
       const r=await fetch(u); const j=await r.json()
@@ -178,7 +180,7 @@ function App(){
   ]
   const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
 
-  // My Ticker
+  // My Ticker (Options)
   const [mySym,setMySym]=useState("AAPL")
   const [myBP,setMyBP]=useState(5000)
   const [myIdea,setMyIdea]=useState(null)
@@ -209,6 +211,7 @@ function App(){
         This is general information only and not financial advice. For personal guidance, please talk to a licensed professional.
       </div>
 
+      {/* MARKET */}
       <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 ideas + insight + headlines.">
         {mhNote && <div role="alert" className="help" style={{color:'var(--danger)'}}>{mhNote}</div>}
         <div className="row">
@@ -252,6 +255,7 @@ function App(){
         )}
       </Panel>
 
+      {/* SCREENER */}
       <Panel id="screener" title="Quick Screener" desc="Type tickers, run, then click a row to see details.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();runScan()}}>
           <div className="input" style={{flex:'1 1 520px'}}>
@@ -264,7 +268,7 @@ function App(){
         </form>
         {scanNote && <div className="help" role="alert" style={{color:'var(--danger)'}}>{scanNote}</div>}
         <Table
-          rows={scanRows}
+          rows={(scan?.results||[])}
           columns={scanCols}
           caption="Ranked by composite score (desc)"
           onRowClick={setSelected}
@@ -295,7 +299,8 @@ function App(){
         </div>
       </Panel>
 
-      <Panel id="myticker" title="Options — My Ticker (single scan)" desc="We pick one contract using liquidity, Δ≈0.30, DTE 21–45 (fallbacks 14–60, 30–90), affordability, and trend alignment.">
+      {/* OPTIONS */}
+      <Panel id="myticker" title="Options — My Ticker" desc="We pick one contract using Δ≈0.30, DTE 21–45 (fallbacks 14–60, 30–90), liquidity, and affordability.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();fetchMyIdea()}}>
           <div className="input">
             <label htmlFor="mysym">Symbol</label>
