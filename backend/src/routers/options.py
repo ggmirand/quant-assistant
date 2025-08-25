@@ -24,7 +24,7 @@ def prob_ST_above_x(S, x, T, r, sigma):
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
 
-# ---- helpers ----
+# ---- small helpers ----
 def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
 
 def fetch_hist(symbol: str, days=200):
@@ -135,8 +135,8 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
         samples=payoff.round(2).tolist()
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
-def load_chain_yf(symbol: str, min_dte=21, max_dte=45):
-    """Only yfinance; never calls Yahoo v7 so we avoid 401/403."""
+def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
+    """Only yfinance; returns book dict."""
     symbol = symbol.upper().strip()
     if yf is None:
         return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
@@ -148,7 +148,7 @@ def load_chain_yf(symbol: str, min_dte=21, max_dte=45):
         for e in expiries:
             try:
                 d=dt.date.fromisoformat(e); dte=(d-today).days
-                if min_dte <= dte <= max_dte: valid.append((d,e,dte))
+                if dte_lo <= dte <= dte_hi: valid.append((d,e,dte))
             except Exception: continue
         # price
         S=None
@@ -167,16 +167,31 @@ def load_chain_yf(symbol: str, min_dte=21, max_dte=45):
                 calls=oc.calls.to_dict(orient="records")
                 puts= oc.puts.to_dict(orient="records")
                 chains.append({"expiry":e_str,"dte":dte,"calls":calls,"puts":puts})
-            except Exception as ex:
-                # common when rate-limited; continue
+            except Exception:
                 continue
-        note = None if chains else "No expiries or chain unavailable in requested window (21–45 DTE)."
+        note = None if chains else f"No expiries or chain unavailable in requested window ({dte_lo}–{dte_hi} DTE)."
         return {"price": S, "expiries": [e for _,e,_ in valid], "chains": chains, "note": note}
     except Exception as ex:
         return {"price": None, "expiries": [], "chains": [], "note": f"yfinance error: {type(ex).__name__}"}
 
+def load_chain_multiwindow(symbol: str):
+    """
+    Try multiple DTE windows:
+      A) 21–45 (preferred)
+      B) 14–60 (fallback #1)
+      C) 30–90 (fallback #2)
+    """
+    for lo,hi in [(21,45),(14,60),(30,90)]:
+        book = _load_chain_yf(symbol, lo, hi)
+        if book.get("chains"): 
+            book["picked_window"] = (lo,hi)
+            return book
+        last = book
+    last["picked_window"] = None
+    return last
+
 def pick_contracts_for_symbol(symbol: str, buying_power: float):
-    book = load_chain_yf(symbol, min_dte=21, max_dte=45)
+    book = load_chain_multiwindow(symbol)
     S = book.get("price") or 0.0
     if not book.get("chains"):
         return {"note": book.get("note"), "under_price": S, "candidates": []}
@@ -199,7 +214,8 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
             cands.append(c)
 
     if not cands:
-        return {"note": book.get("note") or "No affordable/liquid contracts in 21–45 DTE.", "under_price": S, "candidates": []}
+        return {"note": (book.get("note") or "No affordable/liquid contracts in DTE windows tried."),
+                "under_price": S, "candidates": []}
 
     cands_sorted = sorted(cands, key=lambda x: (x["delta_diff"], -x["conf"], x["expiry"]))
     best = cands_sorted[0]
@@ -227,6 +243,7 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
         "under_price": S,
         "trend": trend,
         "note": book.get("note"),
+        "picked_window": book.get("picked_window"),
         "suggestion": best,
         "confidence": best["conf"],
         "cost_estimate": round(best["mid_price"]*100.0, 2),
