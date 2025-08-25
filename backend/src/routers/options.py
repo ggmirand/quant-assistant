@@ -1,7 +1,6 @@
 from fastapi import APIRouter, Query
 import datetime as dt
 import math
-import time
 import numpy as np
 import pandas as pd
 
@@ -12,7 +11,7 @@ except Exception:
 
 router = APIRouter()
 
-# ---- Black–Scholes helpers ----
+# ---------- Black–Scholes-lite ----------
 SQRT_2 = math.sqrt(2.0)
 def norm_cdf(x: float) -> float: return 0.5 * (1.0 + math.erf(x / SQRT_2))
 def bs_d1(S, K, T, r, sigma):
@@ -24,7 +23,7 @@ def prob_ST_above_x(S, x, T, r, sigma):
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
 
-# ---- small helpers ----
+# ---------- helpers ----------
 def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
 
 def fetch_hist(symbol: str, days=200):
@@ -39,7 +38,7 @@ def fetch_hist(symbol: str, days=200):
 def compute_trend(symbol: str):
     S = fetch_hist(symbol, days=200)
     if S is None or len(S) < 50:
-        return {"trend":"neutral","score":0.0,"notes":["Insufficient history for robust trend."]}
+        return {"trend":"neutral","score":0.0,"notes":["Insufficient history for trend."], "rsi": None}
     ema20 = ema(S, 20); ema50 = ema(S, 50)
     ret10 = (S.iloc[-1]/S.iloc[-11] - 1.0) if len(S) > 11 else 0.0
     delta = S.diff().dropna()
@@ -49,10 +48,9 @@ def compute_trend(symbol: str):
     rs = (roll_up/roll_down).replace([np.inf,-np.inf], np.nan).fillna(0.0)
     rsi = 100 - (100/(1+rs))
     rsi_val = float(rsi.iloc[-1])
-    score = 0.0
-    notes = []
+    score = 0.0; notes=[]
     if ema20.iloc[-1] > ema50.iloc[-1]: score += 0.4; notes.append("EMA20 > EMA50 (uptrend).")
-    else: notes.append("EMA20 ≤ EMA50 (down/sideways).")
+    else: notes.append("EMA20 ≤ EMA50 (not an uptrend).")
     if ret10 > 0: score += 0.3; notes.append(f"10‑day momentum +{ret10*100:.1f}%.")
     else: notes.append(f"10‑day momentum {ret10*100:.1f}%.")
     score += 0.3 * max(0.0, 1.0 - abs(rsi_val-50)/50)
@@ -136,7 +134,7 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
 def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
-    """Only yfinance; returns book dict."""
+    """Only yfinance; never calls Yahoo v7 APIs."""
     symbol = symbol.upper().strip()
     if yf is None:
         return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
@@ -169,18 +167,13 @@ def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
                 chains.append({"expiry":e_str,"dte":dte,"calls":calls,"puts":puts})
             except Exception:
                 continue
-        note = None if chains else f"No expiries or chain unavailable in requested window ({dte_lo}–{dte_hi} DTE)."
+        note = None if chains else f"No option chain in {dte_lo}–{dte_hi} DTE."
         return {"price": S, "expiries": [e for _,e,_ in valid], "chains": chains, "note": note}
     except Exception as ex:
         return {"price": None, "expiries": [], "chains": [], "note": f"yfinance error: {type(ex).__name__}"}
 
 def load_chain_multiwindow(symbol: str):
-    """
-    Try multiple DTE windows:
-      A) 21–45 (preferred)
-      B) 14–60 (fallback #1)
-      C) 30–90 (fallback #2)
-    """
+    """Try 21–45 (preferred), then 14–60, then 30–90 DTE."""
     for lo,hi in [(21,45),(14,60),(30,90)]:
         book = _load_chain_yf(symbol, lo, hi)
         if book.get("chains"): 
@@ -194,7 +187,7 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
     book = load_chain_multiwindow(symbol)
     S = book.get("price") or 0.0
     if not book.get("chains"):
-        return {"note": book.get("note"), "under_price": S, "candidates": []}
+        return {"note": book.get("note") or "No option expiries fetched.", "under_price": S, "candidates": []}
     trend = compute_trend(symbol)
     prefer = trend["trend"]
     target_delta = 0.30
@@ -214,7 +207,7 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
             cands.append(c)
 
     if not cands:
-        return {"note": (book.get("note") or "No affordable/liquid contracts in DTE windows tried."),
+        return {"note": (book.get("note") or "No affordable/liquid contracts in tested DTE windows."),
                 "under_price": S, "candidates": []}
 
     cands_sorted = sorted(cands, key=lambda x: (x["delta_diff"], -x["conf"], x["expiry"]))
@@ -228,20 +221,19 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
         f"Affordability: premium ≈ ${best['mid_price']:.2f} (${best['mid_price']*100:.0f} per contract).",
     ]
     if best["type"]=="CALL":
-        summary=(f"This is a CALL. You pay about ${best['mid_price']:.2f} now. "
-                 f"If the stock ends above ${best['breakeven']:.2f} on expiry ({best['expiry']}), you make money; "
-                 f"otherwise you can lose up to what you paid. The model’s chance of profit is "
+        summary=(f"This is a CALL. You pay about ${best['mid_price']:.2f}. "
+                 f"If the stock finishes above ${best['breakeven']:.2f} on {best['expiry']}, you profit; "
+                 f"otherwise your max loss is what you paid. The model’s profit chance is "
                  f"{(best.get('chance_profit') or 0)*100:.1f}%.")
     else:
-        summary=(f"This is a PUT. You pay about ${best['mid_price']:.2f} now. "
-                 f"If the stock ends below ${best['breakeven']:.2f} on expiry ({best['expiry']}), you make money; "
-                 f"otherwise you can lose up to what you paid. The model’s chance of profit is "
+        summary=(f"This is a PUT. You pay about ${best['mid_price']:.2f}. "
+                 f"If the stock finishes below ${best['breakeven']:.2f} on {best['expiry']}, you profit; "
+                 f"otherwise your max loss is what you paid. The model’s profit chance is "
                  f"{(best.get('chance_profit') or 0)*100:.1f}%.")
 
     return {
         "symbol": symbol.upper(),
         "under_price": S,
-        "trend": trend,
         "note": book.get("note"),
         "picked_window": book.get("picked_window"),
         "suggestion": best,
