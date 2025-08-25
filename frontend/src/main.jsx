@@ -14,17 +14,6 @@ const Panel = ({title, children, desc, id}) => (
   </section>
 )
 
-function useFetch(url){
-  const [data,setData]=useState(null), [err,setErr]=useState(null), [loading,setLoading]=useState(true)
-  useEffect(()=>{ let alive=true;
-    setLoading(true)
-    fetch(url).then(r=>r.json()).then(d=>{ if(alive){ setData(d); setLoading(false) } })
-    .catch(e=>{ if(alive){ setErr(e); setLoading(false) } })
-    return ()=>{ alive=false }
-  },[url])
-  return {data,err,loading}
-}
-
 function Table({rows, columns, caption, onRowClick, getRowKey, getRowActive}){
   if (!rows?.length) return <div className="help">No rows.</div>
   return (
@@ -109,7 +98,7 @@ function App(){
   const [apiOk,setApiOk]=useState(null)
   useEffect(()=>{ fetch("http://localhost:8000/health").then(r=>r.json()).then(()=>setApiOk(true)).catch(()=>setApiOk(false)) },[])
 
-  // Market Highlights (manual fetch only)
+  // Market Highlights
   const [sectors,setSectors]=useState(null)
   const [gainers,setGainers]=useState(null)
   const [mhNote,setMhNote]=useState(null)
@@ -125,10 +114,8 @@ function App(){
 
   const topSectors = useMemo(()=>{
     const map = sectors?.["Rank A: Real-Time Performance"] || {}
-    return Object.entries(map)
-      .map(([name,p])=>({sector:name, change: parseFloat(String(p).replace('%',''))}))
-      .filter(x=> isFinite(x.change))
-      .sort((a,b)=> b.change-a.change).slice(0,6)
+    return Object.entries(map).map(([name,p])=>({sector:name, change: parseFloat(String(p).replace('%',''))}))
+      .filter(x=> isFinite(x.change)).sort((a,b)=> b.change-a.change).slice(0,6)
   },[sectors])
   const topGainers = useMemo(()=> (gainers?.top_gainers||[]).slice(0,8).map(x=>({
     ticker: x.ticker, price: x.price, change: x.change_percentage
@@ -140,10 +127,11 @@ function App(){
   const [sectorIdeas, setSectorIdeas] = useState(null)
   const [sectorNews, setSectorNews] = useState(null)
   const [sectorNote, setSectorNote] = useState(null)
+  const [sectorInsight, setSectorInsight] = useState(null)
 
   async function loadSectorIdeas(sectorName){
     setPickedSector(sectorName)
-    setSectorIdeas(null); setSectorNews(null); setSectorNote(null)
+    setSectorIdeas(null); setSectorNews(null); setSectorNote(null); setSectorInsight(null)
     try{
       const u=new URL("http://localhost:8000/api/screener/sector-ideas")
       u.searchParams.set("sector", sectorName)
@@ -151,6 +139,7 @@ function App(){
       const r=await fetch(u); const j=await r.json()
       setSectorIdeas(j.ideas||[])
       setSectorNews(j.news||[])
+      setSectorInsight(j.insight||null)
       setSectorNote(j.note||null)
     }catch(e){
       setSectorNote(String(e))
@@ -159,19 +148,26 @@ function App(){
     }
   }
 
-  // Quick Screener (RESTORED clickable rows + details)
+  // Quick Screener
   const [symbols,setSymbols]=useState("AAPL,MSFT,NVDA,TSLA,AMZN")
   const [scan,setScan]=useState(null)
   const [selected,setSelected]=useState(null)
+  const [scanNote,setScanNote]=useState(null)
   const runScan=async()=>{
-    const u=new URL("http://localhost:8000/api/screener/scan")
-    u.searchParams.set("symbols",symbols)
-    u.searchParams.set("min_volume","1000000")
-    u.searchParams.set("include_history","1")
-    u.searchParams.set("history_days","180")
-    const r=await fetch(u); const j=await r.json()
-    setScan(j); setSelected(null)
+    setScanNote(null)
+    try{
+      const u=new URL("http://localhost:8000/api/screener/scan")
+      u.searchParams.set("symbols",symbols)
+      u.searchParams.set("min_volume","1000000")
+      u.searchParams.set("include_history","1")
+      u.searchParams.set("history_days","180")
+      const r=await fetch(u); const j=await r.json()
+      setScan(j); setSelected(null)
+      if (j.note) setScanNote(j.note)
+    }catch(e){ setScanNote(String(e)) }
   }
+  useEffect(()=>{ runScan() },[]) // auto-run once so you see data
+
   const scanCols = [
     {key:'symbol',label:'Symbol'},
     {key:'price',label:'Price', render:v=>Number(v).toFixed(2)},
@@ -184,7 +180,7 @@ function App(){
   ]
   const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
 
-  // My Ticker (button‑only fetch; no auto)
+  // My Ticker (Options)
   const [mySym,setMySym]=useState("AAPL")
   const [myBP,setMyBP]=useState(5000)
   const [myIdea,setMyIdea]=useState(null)
@@ -216,7 +212,7 @@ function App(){
       </div>
 
       {/* MARKET */}
-      <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 trade ideas + headlines.">
+      <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 ideas + insight + headlines.">
         {mhNote && <div role="alert" className="help" style={{color:'var(--danger)'}}>{mhNote}</div>}
         <div className="row">
           <div style={{flex:'1 1 420px', minWidth:320}}>
@@ -225,11 +221,6 @@ function App(){
               <button className="button" onClick={loadHighlights}>Reload</button>
             </div>
             <SectorBar rows={topSectors} onBarClick={(row)=>{ setPickedSector(row.sector); loadSectorIdeas(row.sector) }}/>
-            <div className="help" style={{marginTop:8, display:'flex', gap:12, alignItems:'center'}}>
-              <label htmlFor="bp">Buying power for ideas ($)</label>
-              <input id="bp" type="number" min="0" value={bp} onChange={e=>setBP(e.target.value)} style={{width:120}}/>
-              <button className="button" onClick={()=> pickedSector && loadSectorIdeas(pickedSector)}>Rescan {pickedSector ? `(${pickedSector})` : ''}</button>
-            </div>
           </div>
           <div style={{flex:'1 1 420px', minWidth:320}}>
             <div className="help" style={{marginBottom:6}}>Top gainers (real tickers)</div>
@@ -240,6 +231,7 @@ function App(){
         {pickedSector && (
           <div className="panel" style={{marginTop:12}}>
             <h3 style={{marginTop:0}}>{pickedSector} — 3 ideas</h3>
+            {sectorInsight && <div className="help" style={{marginBottom:6}}><b>Insight:</b> {sectorInsight}</div>}
             {sectorNote && <div role="alert" className="help" style={{color:'var(--danger)'}}>{sectorNote}</div>}
             {(sectorIdeas||[]).length ? (
               <div className="row">
@@ -274,18 +266,10 @@ function App(){
             <button className="button" type="submit">Scan</button>
           </div>
         </form>
+        {scanNote && <div className="help" role="alert" style={{color:'var(--danger)'}}>{scanNote}</div>}
         <Table
           rows={scanRows}
-          columns={[
-            {key:'symbol',label:'Symbol'},
-            {key:'price',label:'Price', render:v=>Number(v).toFixed(2)},
-            {key:'rsi',label:'RSI', render:v=>Number(v).toFixed(1)},
-            {key:'mom_5d',label:'5d %', render:v=> isNaN(v)?'—':(Number(v)*100).toFixed(1)+'%'},
-            {key:'volume',label:'Volume'},
-            {key:'closes',label:'Spark', render:(v,r)=> <svg width={100} height={26}><polyline fill="none" stroke="var(--accent)" strokeWidth="2" points={
-              (r.closes||[]).map((val,i,arr)=>`${(i/(arr.length-1))*100},${26-(val/Math.max(...arr))*26}`).join(' ')
-            }/></svg>},
-          ]}
+          columns={scanCols}
           caption="Ranked by composite score (desc)"
           onRowClick={setSelected}
           getRowKey={(r)=>r.symbol}
@@ -315,7 +299,7 @@ function App(){
         </div>
       </Panel>
 
-      {/* MY TICKER — BUTTON ONLY */}
+      {/* MY TICKER (Options via yfinance only) */}
       <Panel id="myticker" title="Options — My Ticker (single scan)" desc="We pick one contract using liquidity, Δ≈0.30, DTE 21–45, affordability, and trend alignment.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();fetchMyIdea()}}>
           <div className="input">
