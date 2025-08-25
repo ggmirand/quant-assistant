@@ -1,115 +1,63 @@
-import React, {useRef} from 'react'
-import {
-  Chart as ChartJS, BarElement, BarController,
-  CategoryScale, LinearScale, Tooltip, Legend
-} from 'chart.js'
-import { Bar, getElementAtEvent } from 'react-chartjs-2'
+import React from 'react'
 
-ChartJS.register(BarElement, BarController, CategoryScale, LinearScale, Tooltip, Legend)
-
-const baseOpts = {
-  responsive: true,
-  plugins: { legend: { display: false }, tooltip: { mode: 'index', intersect: false } },
-  scales: {
-    x: { grid: { display:false }, ticks: { color: '#94a3b8' } },
-    y: { grid: { color: 'rgba(148,163,184,0.2)' }, ticks: { color: '#94a3b8' } }
-  }
-}
-
-export function SectorBar({rows = [], onBarClick}) {
-  const labels = rows.map(r => r.sector)
-  const data = {
-    labels,
-    datasets: [{
-      label: '% Change',
-      data: rows.map(r => r.change),
-      borderColor: '#00c805',
-      backgroundColor: 'rgba(0,200,5,0.35)'
-    }]
-  }
-  const ref = useRef(null)
-  const handleClick = (evt) => {
-    if (!onBarClick || !ref.current) return
-    const els = getElementAtEvent(ref.current, evt)
-    if (!els || !els.length) return
-    const idx = els[0].index
-    const row = rows[idx]
-    if (row) onBarClick(row)
-  }
+export function SectorBar({rows=[], onBarClick}){
+  // rows: [{sector, change}]
+  if (!rows.length) return <div className="help">No sector data.</div>
+  const max = Math.max(...rows.map(r=>Math.abs(r.change)||0), 1)
   return (
-    <Bar
-      ref={ref}
-      data={data}
-      onClick={handleClick}
-      options={{
-        ...baseOpts,
-        plugins: {
-          ...baseOpts.plugins,
-          tooltip: { callbacks: { label: c => `${(c.parsed.y || 0).toFixed(2)}%` } }
-        }
-      }}
-    />
+    <div className="card" role="group" aria-label="Sectors">
+      {rows.map((r,i)=>{
+        const w = Math.max(2, Math.round((Math.abs(r.change)/max)*100))
+        const clr = r.change >= 0 ? 'var(--green)' : 'var(--danger)'
+        return (
+          <div key={i} className="row" style={{alignItems:'center', margin:'6px 0', cursor:'pointer'}}
+               onClick={()=>onBarClick && onBarClick(r)}>
+            <div style={{width:160}}>{r.sector}</div>
+            <div style={{flex:'1 1 auto', background:'#1f2937', borderRadius:4, overflow:'hidden'}}>
+              <div style={{height:10, width:`${w}%`, background:clr}} />
+            </div>
+            <div style={{width:70, textAlign:'right', marginLeft:8}}>{r.change.toFixed(2)}%</div>
+          </div>
+        )
+      })}
+    </div>
   )
 }
 
-export function GainersBar({rows = []}) {
-  const labels = rows.map(r => r.ticker)
-  const nums = rows.map(r => parseFloat(String(r.change || '').replace('%', '')) || 0)
-  const data = {
-    labels,
-    datasets: [{
-      label: '% Change',
-      data: nums,
-      borderColor: '#60a5fa',
-      backgroundColor: 'rgba(96,165,250,0.35)'
-    }]
-  }
+export function GainersBar({rows=[]}){
+  // rows: [{ticker, price, change}]
+  if (!rows.length) return <div className="help">No top gainers right now.</div>
   return (
-    <Bar
-      data={data}
-      options={{
-        ...baseOpts,
-        plugins: {
-          ...baseOpts.plugins,
-          tooltip: { callbacks: { label: c => `${(c.parsed.y || 0).toFixed(2)}%` } }
-        }
-      }}
-    />
+    <div className="card" role="list" aria-label="Top gainers">
+      {rows.map((r,i)=>(
+        <div key={i} className="row" role="listitem" style={{alignItems:'center', margin:'6px 0'}}>
+          <div style={{width:80, fontWeight:600}}>{r.ticker}</div>
+          <div style={{width:90}}>${Number(r.price).toFixed(2)}</div>
+          <div style={{color:'var(--green)', fontWeight:600}}>{r.change}</div>
+        </div>
+      ))}
+    </div>
   )
 }
 
-export function Histogram({values = [], bins = 20, color = '#eab308', title = 'Histogram'}) {
-  if (!values?.length) return <div className="help">No data</div>
-  const min = Math.min(...values), max = Math.max(...values)
-  const width = (max - min) || 1
-  const step = width / bins
-  const edges = Array.from({length: bins}, (_, i) => min + i * step)
-  const counts = Array.from({length: bins}, () => 0)
-
-  for (const v of values) {
-    let idx = Math.floor((v - min) / step)
-    if (idx >= bins) idx = bins - 1
-    if (idx < 0) idx = 0
+export function Histogram({values=[], bins=20, color='#60a5fa', title='Histogram'}){
+  if (!values.length) return <div className="help">No data</div>
+  const min = Math.min(...values), max = Math.max(...values), w = max-min || 1
+  const edges = Array.from({length: bins+1}, (_,i)=> min + (i/bins)*w)
+  const counts = new Array(bins).fill(0)
+  for (const v of values){
+    let idx = Math.min(bins-1, Math.max(0, Math.floor(((v-min)/w) * bins)))
     counts[idx]++
   }
-
-  const labels = edges.map((e, i) => (i === 0 ? e.toFixed(2) : ''))
-  const data = {
-    labels,
-    datasets: [{
-      label: title,
-      data: counts,
-      borderColor: color,
-      backgroundColor: `${color}55`
-    }]
-  }
+  const maxC = Math.max(...counts, 1)
   return (
-    <Bar
-      data={data}
-      options={{
-        ...baseOpts,
-        plugins: { ...baseOpts.plugins, legend: { display: false } }
-      }}
-    />
+    <div className="card">
+      <div className="help" style={{marginBottom:6}}>{title}</div>
+      <svg width="100%" height="120" viewBox={`0 0 ${bins*6} 100`} preserveAspectRatio="none" role="img" aria-label="histogram">
+        {counts.map((c,i)=>(
+          <rect key={i} x={i*6} y={100 - (c/maxC)*100} width={5} height={(c/maxC)*100} fill={color}/>
+        ))}
+      </svg>
+    </div>
   )
 }
