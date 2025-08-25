@@ -25,7 +25,7 @@ function useFetch(url){
   return {data,err,loading}
 }
 
-function Table({rows, columns, caption}){
+function Table({rows, columns, caption, onRowClick, getRowKey, getRowActive}){
   if (!rows?.length) return <div className="help">No rows.</div>
   return (
     <div className="table-wrap">
@@ -33,9 +33,17 @@ function Table({rows, columns, caption}){
         {caption && <caption className="help" style={{textAlign:'left', marginBottom:6}}>{caption}</caption>}
         <thead><tr>{columns.map(c=><th key={c.key} scope="col">{c.label}</th>)}</tr></thead>
         <tbody>
-          {rows.map((r,i)=>
-            <tr key={i}>{columns.map(c=><td key={c.key}>{c.render? c.render(r[c.key], r): r[c.key]}</td>)}</tr>
-          )}
+          {rows.map((r,i)=>{
+            const key = getRowKey ? getRowKey(r) : i
+            const active = getRowActive ? getRowActive(r) : false
+            return (
+              <tr key={key}
+                  onClick={onRowClick ? ()=>onRowClick(r) : undefined}
+                  style={{cursor:onRowClick?'pointer':'default', background: active?'rgba(0,200,5,0.08)':'transparent'}}>
+                {columns.map(c=><td key={c.key}>{c.render? c.render(r[c.key], r): r[c.key]}</td>)}
+              </tr>
+            )
+          })}
         </tbody>
       </table>
     </div>
@@ -140,6 +148,31 @@ function App(){
     }
   }
 
+  // Lightweight Screener (RESTORED click + details)
+  const [symbols,setSymbols]=useState("AAPL,MSFT,NVDA,TSLA,AMZN")
+  const [scan,setScan]=useState(null)
+  const [selected,setSelected]=useState(null)
+  const runScan=async()=>{
+    const u=new URL("http://localhost:8000/api/screener/scan")
+    u.searchParams.set("symbols",symbols)
+    u.searchParams.set("min_volume","1000000")
+    u.searchParams.set("include_history","1")
+    u.searchParams.set("history_days","180")
+    const r=await fetch(u); const j=await r.json()
+    setScan(j); setSelected(null)
+  }
+  const scanCols = [
+    {key:'symbol',label:'Symbol'},
+    {key:'price',label:'Price', render:v=>Number(v).toFixed(2)},
+    {key:'rsi',label:'RSI', render:v=>Number(v).toFixed(1)},
+    {key:'mom_5d',label:'5d %', render:v=> isNaN(v)?'—':(Number(v)*100).toFixed(1)+'%'},
+    {key:'volume',label:'Volume'},
+    {key:'closes',label:'Spark', render:(v,r)=> <svg width={100} height={26}><polyline fill="none" stroke="var(--accent)" strokeWidth="2" points={
+      (r.closes||[]).map((val,i,arr)=>`${(i/(arr.length-1))*100},${26-(val/Math.max(...arr))*26}`).join(' ')
+    }/></svg>},
+  ]
+  const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
+
   return (
     <div className="container">
       <header className="header">
@@ -155,11 +188,11 @@ function App(){
       </div>
 
       {/* MARKET */}
-      <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 trade ideas + why it’s moving.">
+      <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 trade ideas + headlines.">
         <div className="row">
           <div style={{flex:'1 1 420px', minWidth:320}}>
             <div className="help" style={{marginBottom:6}}>Sector performance (click to drill down)</div>
-            <SectorBar rows={topSectors} onBarClick={(row)=> loadSectorIdeas(row.sector)}/>
+            <SectorBar rows={topSectors} onBarClick={(row)=>{ setPickedSector(row.sector); loadSectorIdeas(row.sector) }}/>
             <div className="help" style={{marginTop:8, display:'flex', gap:12, alignItems:'center'}}>
               <label htmlFor="bp">Buying power for ideas ($)</label>
               <input id="bp" type="number" min="0" value={bp} onChange={e=>setBP(e.target.value)} style={{width:120}}/>
@@ -198,10 +231,46 @@ function App(){
         )}
       </Panel>
 
-      {/* LIGHT Screener (unchanged) */}
-      <Panel id="about" title="Notes" desc="Click a sector bar, set your buying power, and the assistant auto‑curates up to 3 ideas (option or shares) with probabilities, payoffs, and plain‑English explanation.">
-        <div className="help">
-          Probability numbers and simulations are estimates based on historical data and simple models. They can be wrong.
+      {/* QUICK SCREENER (restored click-to-view) */}
+      <Panel id="screener" title="Quick Screener" desc="Fetches recent stats for a list of tickers. Click a row to view details.">
+        <form className="row" onSubmit={(e)=>{e.preventDefault();runScan()}}>
+          <div className="input" style={{flex:'1 1 520px'}}>
+            <label htmlFor="tickers">Tickers (comma‑separated)</label>
+            <input id="tickers" value={symbols} onChange={e=>setSymbols(e.target.value)} />
+          </div>
+          <div className="input">
+            <button className="button" type="submit">Scan</button>
+          </div>
+        </form>
+        <Table
+          rows={scanRows}
+          columns={scanCols}
+          caption="Ranked by composite score (desc)"
+          onRowClick={setSelected}
+          getRowKey={(r)=>r.symbol}
+          getRowActive={(r)=> selected?.symbol===r.symbol}
+        />
+        <div style={{marginTop:12}}>
+          {selected ? (
+            <div className="row" role="group" aria-label="Selected symbol details">
+              <div style={{flex:'1 1 560px', minWidth:320}}>
+                <div className="help" style={{marginBottom:6}}>
+                  {selected.symbol} — last {selected.closes?.length || 0} days (left=older → right=newer)
+                </div>
+                <PriceVolume closes={selected.closes || []} volumes={selected.volumes || []}/>
+              </div>
+              <div style={{flex:'1 1 280px', minWidth:260}}>
+                <div className="card">
+                  <div style={{fontWeight:600, marginBottom:6}}>{selected.symbol}</div>
+                  <div className="help">Price: <b>{Number(selected.price).toFixed(2)}</b></div>
+                  <div className="help">RSI(14): <b>{Number(selected.rsi).toFixed(1)}</b></div>
+                  <div className="help">EMA(12)/(26): <b>{Number(selected.ema_short).toFixed(2)}</b> / <b>{Number(selected.ema_long).toFixed(2)}</b></div>
+                  <div className="help">5‑day return: <b>{isNaN(selected.mom_5d)?'—':(Number(selected.mom_5d)*100).toFixed(1)+'%'}</b></div>
+                  <div className="help">Volume rank: <b>{(Number(selected.volume_rank_pct)*100).toFixed(0)}%</b></div>
+                </div>
+              </div>
+            </div>
+          ) : <div className="help">Click a screener row to see details here.</div>}
         </div>
       </Panel>
 
@@ -214,3 +283,4 @@ function App(){
 }
 
 createRoot(document.getElementById('root')).render(<App/>)
+
