@@ -109,19 +109,30 @@ function App(){
   const [apiOk,setApiOk]=useState(null)
   useEffect(()=>{ fetch("http://localhost:8000/health").then(r=>r.json()).then(()=>setApiOk(true)).catch(()=>setApiOk(false)) },[])
 
-  // Market Highlights
-  const sectors = useFetch("http://localhost:8000/api/screener/sectors")
-  const movers  = useFetch("http://localhost:8000/api/screener/top-movers")
+  // Market Highlights (manual fetch only)
+  const [sectors,setSectors]=useState(null)
+  const [gainers,setGainers]=useState(null)
+  const [mhNote,setMhNote]=useState(null)
+  async function loadHighlights(){
+    setMhNote(null)
+    try{
+      const r1 = await fetch("http://localhost:8000/api/screener/sectors"); const j1 = await r1.json()
+      const r2 = await fetch("http://localhost:8000/api/screener/top-movers"); const j2 = await r2.json()
+      setSectors(j1); setGainers(j2)
+    }catch(e){ setMhNote(String(e)) }
+  }
+  useEffect(()=>{ loadHighlights() },[])
+
   const topSectors = useMemo(()=>{
-    const map = sectors.data?.["Rank A: Real-Time Performance"] || {}
+    const map = sectors?.["Rank A: Real-Time Performance"] || {}
     return Object.entries(map)
       .map(([name,p])=>({sector:name, change: parseFloat(String(p).replace('%',''))}))
       .filter(x=> isFinite(x.change))
       .sort((a,b)=> b.change-a.change).slice(0,6)
-  },[sectors.data])
-  const topGainers = useMemo(()=> (movers.data?.top_gainers||[]).slice(0,8).map(x=>({
+  },[sectors])
+  const topGainers = useMemo(()=> (gainers?.top_gainers||[]).slice(0,8).map(x=>({
     ticker: x.ticker, price: x.price, change: x.change_percentage
-  })), [movers.data])
+  })), [gainers])
 
   // Sector click-through
   const [pickedSector, setPickedSector] = useState(null)
@@ -148,7 +159,7 @@ function App(){
     }
   }
 
-  // Lightweight Screener (RESTORED click + details)
+  // Quick Screener (RESTORED clickable rows + details)
   const [symbols,setSymbols]=useState("AAPL,MSFT,NVDA,TSLA,AMZN")
   const [scan,setScan]=useState(null)
   const [selected,setSelected]=useState(null)
@@ -173,6 +184,23 @@ function App(){
   ]
   const scanRows = useMemo(()=> (scan?.results || []).sort((a,b)=> (b.score ?? 0) - (a.score ?? 0)), [scan?.results])
 
+  // My Ticker (button‑only fetch; no auto)
+  const [mySym,setMySym]=useState("AAPL")
+  const [myBP,setMyBP]=useState(5000)
+  const [myIdea,setMyIdea]=useState(null)
+  const [myErr,setMyErr]=useState(null)
+  const [myLoad,setMyLoad]=useState(false)
+  async function fetchMyIdea(){
+    setMyErr(null); setMyLoad(true)
+    try{
+      const u=new URL("http://localhost:8000/api/options/idea")
+      u.searchParams.set("symbol", mySym)
+      u.searchParams.set("buying_power", String(myBP))
+      const r=await fetch(u); const j=await r.json()
+      setMyIdea(j)
+    }catch(e){ setMyErr(String(e)) } finally { setMyLoad(false) }
+  }
+
   return (
     <div className="container">
       <header className="header">
@@ -189,9 +217,13 @@ function App(){
 
       {/* MARKET */}
       <Panel id="highlights" title="Market Highlights" desc="Top sectors & verified top gainers. Click a sector to see 3 trade ideas + headlines.">
+        {mhNote && <div role="alert" className="help" style={{color:'var(--danger)'}}>{mhNote}</div>}
         <div className="row">
           <div style={{flex:'1 1 420px', minWidth:320}}>
-            <div className="help" style={{marginBottom:6}}>Sector performance (click to drill down)</div>
+            <div className="help" style={{marginBottom:6, display:'flex', gap:10, alignItems:'center'}}>
+              <span>Sector performance (click to drill down)</span>
+              <button className="button" onClick={loadHighlights}>Reload</button>
+            </div>
             <SectorBar rows={topSectors} onBarClick={(row)=>{ setPickedSector(row.sector); loadSectorIdeas(row.sector) }}/>
             <div className="help" style={{marginTop:8, display:'flex', gap:12, alignItems:'center'}}>
               <label htmlFor="bp">Buying power for ideas ($)</label>
@@ -231,8 +263,8 @@ function App(){
         )}
       </Panel>
 
-      {/* QUICK SCREENER (restored click-to-view) */}
-      <Panel id="screener" title="Quick Screener" desc="Fetches recent stats for a list of tickers. Click a row to view details.">
+      {/* QUICK SCREENER */}
+      <Panel id="screener" title="Quick Screener" desc="Type tickers, run, then click a row to see details.">
         <form className="row" onSubmit={(e)=>{e.preventDefault();runScan()}}>
           <div className="input" style={{flex:'1 1 520px'}}>
             <label htmlFor="tickers">Tickers (comma‑separated)</label>
@@ -244,7 +276,16 @@ function App(){
         </form>
         <Table
           rows={scanRows}
-          columns={scanCols}
+          columns={[
+            {key:'symbol',label:'Symbol'},
+            {key:'price',label:'Price', render:v=>Number(v).toFixed(2)},
+            {key:'rsi',label:'RSI', render:v=>Number(v).toFixed(1)},
+            {key:'mom_5d',label:'5d %', render:v=> isNaN(v)?'—':(Number(v)*100).toFixed(1)+'%'},
+            {key:'volume',label:'Volume'},
+            {key:'closes',label:'Spark', render:(v,r)=> <svg width={100} height={26}><polyline fill="none" stroke="var(--accent)" strokeWidth="2" points={
+              (r.closes||[]).map((val,i,arr)=>`${(i/(arr.length-1))*100},${26-(val/Math.max(...arr))*26}`).join(' ')
+            }/></svg>},
+          ]}
           caption="Ranked by composite score (desc)"
           onRowClick={setSelected}
           getRowKey={(r)=>r.symbol}
@@ -266,12 +307,32 @@ function App(){
                   <div className="help">RSI(14): <b>{Number(selected.rsi).toFixed(1)}</b></div>
                   <div className="help">EMA(12)/(26): <b>{Number(selected.ema_short).toFixed(2)}</b> / <b>{Number(selected.ema_long).toFixed(2)}</b></div>
                   <div className="help">5‑day return: <b>{isNaN(selected.mom_5d)?'—':(Number(selected.mom_5d)*100).toFixed(1)+'%'}</b></div>
-                  <div className="help">Volume rank: <b>{(Number(selected.volume_rank_pct)*100).toFixed(0)}%</b></div>
+                  <div className="help">Volume: <b>{Number(selected.volume).toLocaleString()}</b></div>
                 </div>
               </div>
             </div>
           ) : <div className="help">Click a screener row to see details here.</div>}
         </div>
+      </Panel>
+
+      {/* MY TICKER — BUTTON ONLY */}
+      <Panel id="myticker" title="Options — My Ticker (single scan)" desc="We pick one contract using liquidity, Δ≈0.30, DTE 21–45, affordability, and trend alignment.">
+        <form className="row" onSubmit={(e)=>{e.preventDefault();fetchMyIdea()}}>
+          <div className="input">
+            <label htmlFor="mysym">Symbol</label>
+            <input id="mysym" value={mySym} onChange={e=>setMySym(e.target.value.toUpperCase())}/>
+          </div>
+          <div className="input">
+            <label htmlFor="mybp">Buying power ($)</label>
+            <input id="mybp" type="number" min="0" inputMode="numeric" value={myBP} onChange={e=>setMyBP(e.target.value)}/>
+          </div>
+          <div className="input">
+            <button className="button" type="submit">{myLoad? 'Working…' : 'Get idea'}</button>
+          </div>
+        </form>
+        {myErr && <div role="alert" className="help" style={{color:'var(--danger)'}}>{String(myErr)}</div>}
+        {myIdea?.note && <div className="help" style={{color:'var(--danger)'}}>{String(myIdea.note)}</div>}
+        {myIdea?.suggestion ? <SuggestionCard sug={myIdea}/> : <div className="help" style={{marginTop:8}}>No suggestion yet.</div>}
       </Panel>
 
       <Glossary />
@@ -283,4 +344,3 @@ function App(){
 }
 
 createRoot(document.getElementById('root')).render(<App/>)
-
