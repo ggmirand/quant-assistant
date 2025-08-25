@@ -1,12 +1,9 @@
-from fastapi import APIRouter, Query, Body
-from pydantic import BaseModel
+from fastapi import APIRouter, Query
 import datetime as dt
 import math
 import time
 import numpy as np
 import pandas as pd
-import requests
-from requests import HTTPError
 
 try:
     import yfinance as yf
@@ -15,7 +12,7 @@ except Exception:
 
 router = APIRouter()
 
-# ---------------- Black–Scholes helpers ----------------
+# ---- Black–Scholes helpers ----
 SQRT_2 = math.sqrt(2.0)
 def norm_cdf(x: float) -> float: return 0.5 * (1.0 + math.erf(x / SQRT_2))
 def bs_d1(S, K, T, r, sigma):
@@ -27,174 +24,9 @@ def prob_ST_above_x(S, x, T, r, sigma):
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
 
-# ---------------- Models ----------------
-class ScanReq(BaseModel):
-    buying_power: float
-    universe: list[str] | None = None
+# ---- helpers ----
+def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
 
-# ---------------- HTTP session ----------------
-UA = "Mozilla/5.0 (compatible; QuantAssistant/1.0)"
-SESSION = requests.Session()
-SESSION.headers.update({"User-Agent": UA, "Accept": "application/json"})
-
-def _req_json(url, params=None, retries=1, timeout=5.0):
-    """GET JSON with small retry + friendly HTTP error surface."""
-    last_err = None
-    for i in range(retries+1):
-        try:
-            r = SESSION.get(url, params=params, timeout=timeout)
-            if r.status_code in (401,403,429,502,503):
-                last_err = HTTPError(f"HTTP {r.status_code}", response=r)
-                time.sleep(0.6 if i < retries else 0)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except Exception as e:
-            last_err = e
-            time.sleep(0.4 if i < retries else 0)
-    raise last_err
-
-# ---------------- Yahoo v7 options (query2 -> query1) ----------------
-def _v7_options_book(symbol: str):
-    base_q2 = f"https://query2.finance.yahoo.com/v7/finance/options/{symbol}"
-    base_q1 = f"https://query1.finance.yahoo.com/v7/finance/options/{symbol}"
-    try:
-        j0 = _req_json(base_q2)
-    except Exception:
-        j0 = _req_json(base_q1)
-    res = (j0 or {}).get("optionChain", {}).get("result") or []
-    if not res:
-        return {"price": None, "expiries": [], "chains": []}
-    node0 = res[0]
-    price = None
-    try: price = float(node0.get("quote", {}).get("regularMarketPrice"))
-    except Exception: price = None
-
-    exp_ts = node0.get("expirationDates") or []
-    expiries = []
-    for ts in exp_ts:
-        try:
-            d = dt.datetime.utcfromtimestamp(int(ts)).date().isoformat()
-            expiries.append(d)
-        except Exception: continue
-
-    chains = []
-    for chunk in res:
-        for opts in chunk.get("options", []):
-            exp_ts_single = opts.get("expirationDate")
-            if not exp_ts_single: continue
-            try:
-                d = dt.datetime.utcfromtimestamp(int(exp_ts_single)).date()
-                e = d.isoformat()
-            except Exception:
-                continue
-            calls = opts.get("calls", []) or []
-            puts  = opts.get("puts",  []) or []
-
-            def norm(rows):
-                out=[]
-                for r in rows:
-                    try:
-                        out.append({
-                            "strike": float(r.get("strike")),
-                            "bid": float(r.get("bid") or 0.0),
-                            "ask": float(r.get("ask") or 0.0),
-                            "lastPrice": float(r.get("lastPrice") or 0.0),
-                            "openInterest": int(r.get("openInterest") or 0),
-                            "volume": int(r.get("volume") or 0),
-                            "impliedVolatility": float(r.get("impliedVolatility") or 0.0),
-                        })
-                    except Exception:
-                        continue
-                return out
-            chains.append({"expiry": e, "dte": max((d - dt.date.today()).days, 0),
-                           "calls": norm(calls), "puts": norm(puts)})
-    return {"price": price, "expiries": expiries, "chains": chains}
-
-# ---------------- Data loading (yfinance first, then v7) ----------------
-def load_chain(symbol: str, min_dte=21, max_dte=45):
-    symbol = symbol.upper().strip()
-    note = None
-
-    # 1) yfinance path (prefer)
-    if yf is not None:
-        try:
-            tkr = yf.Ticker(symbol)
-            expiries = list(getattr(tkr, "options", []) or [])
-            today = dt.date.today()
-            valid=[]
-            for e in expiries:
-                try:
-                    d=dt.date.fromisoformat(e); dte=(d-today).days
-                    if min_dte <= dte <= max_dte: valid.append((d,e,dte))
-                except Exception: continue
-            # price
-            S=None
-            try:
-                info=tkr.fast_info; S=float(info.get("last_price"))
-            except Exception:
-                try:
-                    hist=tkr.history(period="5d", interval="1d")
-                    S=float(hist["Close"].dropna().iloc[-1])
-                except Exception: S=None
-
-            chains=[]
-            for _,e_str,dte in valid:
-                try:
-                    oc=tkr.option_chain(e_str)
-                    calls=oc.calls.to_dict(orient="records")
-                    puts= oc.puts.to_dict(orient="records")
-                    chains.append({"expiry":e_str,"dte":dte,"calls":calls,"puts":puts})
-                except Exception as ex:
-                    if "429" in str(ex) or "Too Many Requests" in str(ex):
-                        note="Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
-                    else:
-                        note = note or f"yfinance chain error: {type(ex).__name__}"
-                    continue
-            if chains:
-                book={"price":S,"expiries":[e for _,e,_ in valid],"chains": chains}
-                if note: book["note"]=note
-                return book
-        except Exception as ex:
-            if "429" in str(ex) or "Too Many Requests" in str(ex):
-                note="Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
-            else:
-                note=f"yfinance error: {type(ex).__name__}"
-
-    # 2) Yahoo v7 fallback
-    try:
-        v7=_v7_options_book(symbol)
-        today=dt.date.today()
-        chains_filt=[]
-        for ch in v7.get("chains", []):
-            try:
-                d=dt.date.fromisoformat(ch["expiry"]); dte=(d-today).days
-                if min_dte <= dte <= max_dte:
-                    ch["dte"]=dte
-                    chains_filt.append(ch)
-            except Exception: continue
-        book={"price": v7.get("price"), "expiries": [c["expiry"] for c in chains_filt], "chains": chains_filt}
-        if not book["expiries"]:
-            book["note"]=note or "No expiries in requested window."
-        elif note:
-            book["note"]=note
-        return book
-    except HTTPError as ex:
-        code = getattr(ex.response, "status_code", None)
-        if code == 429:
-            msg = "Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
-        else:
-            msg = f"Data provider HTTP error ({code or 'unknown'}). Try again shortly."
-        return {"price": None, "expiries": [], "chains": [], "note": msg}
-    except Exception as ex:
-        msg = str(ex)
-        if "429" in msg or "Too Many Requests" in msg:
-            note="Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh."
-        else:
-            note=f"provider error: {type(ex).__name__}"
-        return {"price":None,"expiries":[],"chains":[],"note":note}
-
-# ---------------- Indicators & selection ----------------
 def fetch_hist(symbol: str, days=200):
     if yf is None: return None
     try:
@@ -203,8 +35,6 @@ def fetch_hist(symbol: str, days=200):
         return hist["Close"].dropna()
     except Exception:
         return None
-
-def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
 
 def compute_trend(symbol: str):
     S = fetch_hist(symbol, days=200)
@@ -219,7 +49,6 @@ def compute_trend(symbol: str):
     rs = (roll_up/roll_down).replace([np.inf,-np.inf], np.nan).fillna(0.0)
     rsi = 100 - (100/(1+rs))
     rsi_val = float(rsi.iloc[-1])
-
     score = 0.0
     notes = []
     if ema20.iloc[-1] > ema50.iloc[-1]: score += 0.4; notes.append("EMA20 > EMA50 (uptrend).")
@@ -234,22 +63,26 @@ def compute_trend(symbol: str):
 def enrich_contracts(S, expiry_iso, rows, is_call: bool):
     out=[]
     if not rows: return out
-    try: expiry = dt.datetime.fromisoformat(expiry_iso).date()
+    try: expiry = dt.date.fromisoformat(expiry_iso)
     except Exception: return out
     T = max(((expiry - dt.date.today()).days)/365.0, 1.0/365.0)
     r = 0.0
     for rrow in rows:
-        K = float(rrow.get("strike") or 0.0)
-        bid = float(rrow.get("bid") or 0.0)
-        ask = float(rrow.get("ask") or 0.0)
-        last= float(rrow.get("lastPrice") or 0.0)
-        oi  = int(rrow.get("openInterest") or 0)
-        vol = int(rrow.get("volume") or 0)
+        try:
+            K = float(rrow.get("strike") or rrow.get("Strike") or 0.0)
+            bid = float(rrow.get("bid") or rrow.get("Bid") or 0.0)
+            ask = float(rrow.get("ask") or rrow.get("Ask") or 0.0)
+            last= float(rrow.get("lastPrice") or rrow.get("Last Price") or 0.0)
+            oi  = int(rrow.get("openInterest") or rrow.get("Open Interest") or 0)
+            vol = int(rrow.get("volume") or rrow.get("Volume") or 0)
+            iv  = float(rrow.get("impliedVolatility") or rrow.get("Implied Volatility") or 0.0)
+        except Exception:
+            continue
         premium = (bid+ask)/2.0 if (bid>0 or ask>0) else last
-        iv_raw  = float(rrow.get("impliedVolatility") or 0.0)
-        sigma = max(iv_raw, 1e-6)
         if not (math.isfinite(S) and K>0 and premium>0): continue
-        dlt = call_delta(S,K,T,r,sigma) if is_call else (call_delta(S,K,T,r,sigma)-1.0)
+        sigma = max(iv, 1e-6)
+        dlt = call_delta(S,K,T,r,sigma)
+        if not is_call: dlt = dlt - 1.0
         breakeven = (K + premium) if is_call else (K - premium)
         p_profit = prob_ST_above_x(S, breakeven, T, r, sigma) if is_call else (1.0 - prob_ST_above_x(S, breakeven, T, r, sigma))
         out.append({
@@ -279,21 +112,16 @@ def confidence_score(c):
     else: score += 2
     return min(100, score)
 
-def estimate_mu_sigma_daily(symbol: str):
-    if yf is None: return None, None
+def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, T_days: int, otype: str, n_paths=900, sample_out=300):
+    if yf is None or S<=0 or K<=0 or T_days<=0: return None
     try:
         hist = yf.Ticker(symbol).history(period="1y", interval="1d")
         close = hist["Close"].dropna()
-        if len(close) < 30: return None, None
+        if len(close) < 30: return None
         lr = np.log(close / close.shift(1)).dropna().values
-        mu_d = float(np.mean(lr)); sig_d=float(np.std(lr))
-        return mu_d, sig_d
+        mu_d = float(np.mean(lr)); sig_d = float(np.std(lr))
     except Exception:
-        return None, None
-
-def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, T_days: int, otype: str, n_paths=1200, sample_out=300):
-    mu_d, sig_d = estimate_mu_sigma_daily(symbol)
-    if mu_d is None or sig_d is None or S<=0 or K<=0 or T_days<=0: return None
+        return None
     T=float(T_days)
     Z=np.random.normal(0,1,size=n_paths)
     ST=S*np.exp((mu_d-0.5*sig_d**2)*T + sig_d*np.sqrt(T)*Z)
@@ -307,8 +135,48 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
         samples=payoff.round(2).tolist()
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
+def load_chain_yf(symbol: str, min_dte=21, max_dte=45):
+    """Only yfinance; never calls Yahoo v7 so we avoid 401/403."""
+    symbol = symbol.upper().strip()
+    if yf is None:
+        return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
+    try:
+        tkr = yf.Ticker(symbol)
+        expiries = list(getattr(tkr, "options", []) or [])
+        today = dt.date.today()
+        valid=[]
+        for e in expiries:
+            try:
+                d=dt.date.fromisoformat(e); dte=(d-today).days
+                if min_dte <= dte <= max_dte: valid.append((d,e,dte))
+            except Exception: continue
+        # price
+        S=None
+        try:
+            info=tkr.fast_info; S=float(info.get("last_price"))
+        except Exception:
+            try:
+                hist=tkr.history(period="5d", interval="1d")
+                S=float(hist["Close"].dropna().iloc[-1])
+            except Exception: S=None
+
+        chains=[]
+        for _,e_str,dte in valid:
+            try:
+                oc=tkr.option_chain(e_str)
+                calls=oc.calls.to_dict(orient="records")
+                puts= oc.puts.to_dict(orient="records")
+                chains.append({"expiry":e_str,"dte":dte,"calls":calls,"puts":puts})
+            except Exception as ex:
+                # common when rate-limited; continue
+                continue
+        note = None if chains else "No expiries or chain unavailable in requested window (21–45 DTE)."
+        return {"price": S, "expiries": [e for _,e,_ in valid], "chains": chains, "note": note}
+    except Exception as ex:
+        return {"price": None, "expiries": [], "chains": [], "note": f"yfinance error: {type(ex).__name__}"}
+
 def pick_contracts_for_symbol(symbol: str, buying_power: float):
-    book = load_chain(symbol, min_dte=21, max_dte=45)
+    book = load_chain_yf(symbol, min_dte=21, max_dte=45)
     S = book.get("price") or 0.0
     if not book.get("chains"):
         return {"note": book.get("note"), "under_price": S, "candidates": []}
@@ -331,7 +199,7 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
             cands.append(c)
 
     if not cands:
-        return {"note": book.get("note") or "No affordable/liquid contracts in DTE window.", "under_price": S, "candidates": []}
+        return {"note": book.get("note") or "No affordable/liquid contracts in 21–45 DTE.", "under_price": S, "candidates": []}
 
     cands_sorted = sorted(cands, key=lambda x: (x["delta_diff"], -x["conf"], x["expiry"]))
     best = cands_sorted[0]
@@ -367,35 +235,6 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
         "thought_process": thought
     }
 
-# ---------------- Public endpoints ----------------
 @router.get("/idea")
 def idea(symbol: str = Query(...), buying_power: float = Query(..., ge=0.0)):
     return pick_contracts_for_symbol(symbol, buying_power)
-
-DEFAULT_UNIVERSE = [
-    "AAPL","MSFT","NVDA","AMZN","META","TSLA","GOOGL","AVGO","AMD",
-    "NFLX","JPM","BRK-B","XOM","V","MA","COST","LIN","PEP","WMT","CRM"
-]
-
-@router.post("/scan-ideas")
-def scan_ideas(req: ScanReq):
-    uni = [u.upper().strip() for u in (req.universe or DEFAULT_UNIVERSE) if u]
-    ideas=[]
-    for sym in uni:
-        try:
-            res = pick_contracts_for_symbol(sym, req.buying_power)
-            if res.get("suggestion"): ideas.append(res)
-        except Exception:
-            continue
-        time.sleep(0.12)
-        if len(ideas) >= 6:
-            break
-    def rank_key(x):
-        conf = x.get("confidence",0)
-        med  = (x.get("sim") or {}).get("pl_p50", -9999)
-        return (-conf, -med)
-    ideas_sorted = sorted(ideas, key=rank_key)[:3]
-    note=None
-    for r in ideas:
-        if r.get("note"): note=r["note"]; break
-    return {"ideas": ideas_sorted, **({"note": note} if note else {})}
