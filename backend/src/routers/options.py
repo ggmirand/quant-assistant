@@ -47,15 +47,25 @@ class PortfolioReq(BaseModel):
     goal: str = "directional"  # "directional" | "income" | "hedge" (future use)
     positions: list[PortfolioPos] = []
 
-# ---------- Data fetch ----------
+# ---------- Data fetch (with 429‑safe guards) ----------
 def load_chain(symbol: str, min_dte=7, max_dte=45):
+    """
+    Fetch real option chains using yfinance.
+    Returns a dict that ALWAYS has keys: price, expiries, chains, note (optional).
+    Gracefully handles Yahoo rate limits (HTTP 429) and other errors.
+    """
     if yf is None:
-        return None
+        return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
 
-    tkr = yf.Ticker(symbol)
-    expiries = list(getattr(tkr, "options", []) or [])
+    # Build ticker + expiries
+    try:
+        tkr = yf.Ticker(symbol)
+        expiries = list(getattr(tkr, "options", []) or [])
+    except Exception as e:
+        return {"price": None, "expiries": [], "chains": [], "note": f"ticker fetch failed: {type(e).__name__}"}
+
+    # Filter expiries by DTE
     today = dt.date.today()
-
     valid = []
     for e in expiries:
         try:
@@ -66,14 +76,12 @@ def load_chain(symbol: str, min_dte=7, max_dte=45):
         except Exception:
             continue
 
-    if not valid:
-        return {"price": None, "expiries": [], "chains": []}
-
+    # Underlying price
     S = None
-    # last price via fast_info, fallback to last close
+    note = None
     try:
         info = tkr.fast_info
-        S = float(info["last_price"])
+        S = float(info.get("last_price"))
     except Exception:
         try:
             hist = tkr.history(period="5d", interval="1d")
@@ -81,20 +89,28 @@ def load_chain(symbol: str, min_dte=7, max_dte=45):
         except Exception:
             S = None
 
+    # Pull chains per expiry; tolerate failures (incl. 429)
     chains = []
     for _, e_str, dte in valid:
         try:
-            oc = tkr.option_chain(e_str)  # pandas DFs: calls, puts
-        except Exception:
+            oc = tkr.option_chain(e_str)
+            calls = oc.calls.to_dict(orient="records")
+            puts  = oc.puts.to_dict(orient="records")
+            chains.append({"expiry": e_str, "dte": dte, "calls": calls, "puts": puts})
+        except Exception as ex:
+            msg = str(ex)
+            if "429" in msg or "Too Many Requests" in msg:
+                note = "Rate limited by data source (HTTP 429). Please wait ~1–2 minutes or reduce refresh frequency."
+            # skip this expiry; continue with others
             continue
-        chains.append({
-            "expiry": e_str,
-            "dte": dte,
-            "calls": oc.calls.to_dict(orient="records"),
-            "puts":  oc.puts.to_dict(orient="records")
-        })
-    return {"price": S, "expiries": [e for _, e, _ in valid], "chains": chains}
 
+    # If nothing usable came back
+    if not chains and note is None and valid:
+        note = "No option data returned (provider error). Try again later."
+
+    return {"price": S, "expiries": [e for _, e, _ in valid], "chains": chains, **({"note": note} if note else {})}
+
+# ---------- Enrichment, selection, and simulation ----------
 def enrich_contracts(S, expiry_iso, rows, is_call: bool):
     out = []
     if not rows:
@@ -149,7 +165,6 @@ def pick_by_target_delta(contracts, target_abs_delta=0.25):
         return abs(abs(d) - target_abs_delta) if d is not None else 999
     return sorted(contracts, key=key)[0]
 
-# ---------- Simple MC for option P/L summary ----------
 def estimate_mu_sigma_daily(symbol: str):
     if yf is None:
         return None, None
@@ -170,7 +185,6 @@ def simulate_option_pl(symbol: str, S: float, K: float, premium: float, T_days: 
     if mu_d is None or sig_d is None or S <= 0 or K <= 0 or T_days <= 0:
         return None
     T = float(T_days)
-    # GBM: S_T = S * exp((mu - 0.5*sig^2)*T + sig*sqrt(T)*Z), with daily params
     Z = np.random.normal(0, 1, size=n_paths)
     ST = S * np.exp((mu_d - 0.5 * sig_d**2) * T + sig_d * np.sqrt(T) * Z)
     if otype.upper() == "CALL":
@@ -181,7 +195,7 @@ def simulate_option_pl(symbol: str, S: float, K: float, premium: float, T_days: 
     prob_profit = float((payoff > 0.0).mean())
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit}
 
-# ---------- Endpoints ----------
+# ---------- Public endpoints ----------
 @router.get("/best-trades")
 def best_trades(
     symbol: str = Query(..., description="Ticker, e.g. AAPL"),
@@ -198,7 +212,7 @@ def best_trades(
     symbol = symbol.upper().strip()
     book = load_chain(symbol, min_dte=min_dte, max_dte=max_dte)
     if not book or not book.get("chains"):
-        return {"symbol": symbol, "price": book.get("price"), "candidates": []}
+        return {"symbol": symbol, "price": book.get("price"), "note": book.get("note"), "candidates": []}
 
     S = float(book.get("price") or 0.0)
     candidates = []
@@ -212,8 +226,8 @@ def best_trades(
             if (c["mid_price"] * 100.0) <= buying_power:  # 1 contract affordability
                 candidates.append(c)
 
-    # fallback: if nothing affordable, include closest anyway
     if not candidates:
+        # fallback: include closest anyway
         for ch in book["chains"]:
             calls = enrich_contracts(S, ch["expiry"], ch["calls"], True)
             puts  = enrich_contracts(S, ch["expiry"], ch["puts"],  False)
@@ -221,7 +235,6 @@ def best_trades(
                       pick_by_target_delta(puts,  target_abs_delta)]:
                 if c: candidates.append(c)
 
-    # Sort by closeness to target delta, then earlier expiry
     final = sorted(candidates, key=lambda c: (abs(abs(c["delta"] or 9) - target_abs_delta), c["expiry"]))[:limit]
 
     return {
@@ -229,6 +242,7 @@ def best_trades(
         "price": S,
         "target_abs_delta": target_abs_delta,
         "min_dte": min_dte, "max_dte": max_dte,
+        "note": book.get("note"),
         "candidates": final
     }
 
@@ -246,6 +260,9 @@ def portfolio_suggestions(req: PortfolioReq = Body(...)):
     for sym in tickers:
         book = load_chain(sym, min_dte=7, max_dte=45)
         if not book or not book.get("chains"):
+            # bubble up note if present
+            if book and book.get("note"):
+                out.append({"symbol": sym, "note": book["note"], "suggestion": None})
             continue
         S = float(book.get("price") or 0.0)
         if S <= 0:
@@ -297,5 +314,11 @@ def portfolio_suggestions(req: PortfolioReq = Body(...)):
             })
 
     # top 3 across all symbols
-    out = sorted(out, key=lambda x: (abs(abs(x["suggestion"].get("delta") or 9) - 0.25), x["suggestion"]["expiry"]))[:3]
-    return {"suggestions": out}
+    out = sorted(out, key=lambda x: (abs(abs((x.get("suggestion") or {}).get("delta") or 9) - 0.25),
+                                     (x.get("suggestion") or {}).get("expiry", "9999-12-31")))[:3]
+    # If any upstream note (e.g., rate limit) exists, surface it at the top level too
+    top_note = None
+    for item in out:
+        if isinstance(item, dict) and item.get("note") and "Rate limited" in item["note"]:
+            top_note = item["note"]; break
+    return {"suggestions": out, **({"note": top_note} if top_note else {})}
