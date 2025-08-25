@@ -1,9 +1,9 @@
-import React from 'react'
+import React, {useRef} from 'react'
 import {
   Chart as ChartJS, BarElement, BarController,
   CategoryScale, LinearScale, Tooltip, Legend
 } from 'chart.js'
-import { Bar } from 'react-chartjs-2'
+import { Bar, getElementAtEvent } from 'react-chartjs-2'
 
 ChartJS.register(BarElement, BarController, CategoryScale, LinearScale, Tooltip, Legend)
 
@@ -16,7 +16,7 @@ const baseOpts = {
   }
 }
 
-export function SectorBar({rows = []}) {
+export function SectorBar({rows = [], onBarClick}) {
   const labels = rows.map(r => r.sector)
   const data = {
     labels,
@@ -27,9 +27,20 @@ export function SectorBar({rows = []}) {
       backgroundColor: 'rgba(0,200,5,0.35)'
     }]
   }
+  const ref = useRef(null)
+  const handleClick = (evt) => {
+    if (!onBarClick || !ref.current) return
+    const els = getElementAtEvent(ref.current, evt)
+    if (!els || !els.length) return
+    const idx = els[0].index
+    const row = rows[idx]
+    if (row) onBarClick(row)
+  }
   return (
     <Bar
+      ref={ref}
       data={data}
+      onClick={handleClick}
       options={{
         ...baseOpts,
         plugins: {
