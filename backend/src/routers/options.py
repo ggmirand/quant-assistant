@@ -1,9 +1,12 @@
 from fastapi import APIRouter, Query
 import datetime as dt
 import math
+import os
+from typing import Optional, List, Dict
+
 import numpy as np
 import pandas as pd
-from typing import Optional
+import requests
 
 try:
     import yfinance as yf
@@ -11,8 +14,13 @@ except Exception:
     yf = None
 
 router = APIRouter()
+UA = "Mozilla/5.0 (compatible; QuantAssistant/0.9)"
+R = requests.Session()
+R.headers.update({"User-Agent": UA, "Accept": "application/json"})
 
-# ----- light Black–Scholes bits -----
+TRADIER_TOKEN = os.getenv("TRADIER_TOKEN")  # optional; add to your env to use Tradier provider
+
+# ---------- math bits ----------
 SQRT_2 = math.sqrt(2.0)
 def norm_cdf(x: float) -> float: return 0.5 * (1.0 + math.erf(x / SQRT_2))
 def bs_d1(S, K, T, r, sigma):
@@ -23,8 +31,27 @@ def prob_ST_above_x(S, x, T, r, sigma):
     if not (S>0 and x>0 and T>0 and sigma>0): return float("nan")
     d = (math.log(S/x) + (r - 0.5*sigma*sigma)*T) / (sigma*math.sqrt(T))
     return norm_cdf(d)
-
 def ema(series: pd.Series, span: int): return series.ewm(span=span, adjust=False).mean()
+
+# ---------- price & history helpers ----------
+def _last_price(symbol: str) -> Optional[float]:
+    if yf is not None:
+        try:
+            info = yf.Ticker(symbol).fast_info
+            for k in ("last_price","regularMarketPrice","regular_market_price"):
+                v = info.get(k)
+                if v is not None: return float(v)
+        except Exception:
+            pass
+    # fallback: last close (stooq via screener’s helper idea—simple yfinance history here)
+    if yf is not None:
+        try:
+            h = yf.Ticker(symbol).history(period="5d", interval="1d")
+            c = h["Close"].dropna()
+            if len(c): return float(c.iloc[-1])
+        except Exception:
+            pass
+    return None
 
 def fetch_hist(symbol: str, days=200):
     if yf is None: return None
@@ -58,6 +85,66 @@ def compute_trend(symbol: str):
     trend = "up" if score >= 0.55 else ("down" if score <= 0.35 else "neutral")
     return {"trend":trend, "score":score, "notes":notes, "rsi": rsi_val}
 
+# ---------- options providers ----------
+def _tradier_headers():
+    return {"Authorization": f"Bearer {TRADIER_TOKEN}", "Accept": "application/json", "User-Agent": UA}
+
+def tradier_expirations(symbol: str) -> List[str]:
+    url = "https://api.tradier.com/v1/markets/options/expirations"
+    r = R.get(url, params={"symbol": symbol, "includeAllRoots": "true", "strikes": "false"},
+              headers=_tradier_headers(), timeout=7)
+    r.raise_for_status()
+    j = r.json()
+    exps = (((j or {}).get("expirations") or {}).get("date")) or []
+    # API returns list of strings already
+    return [e for e in exps if isinstance(e, str)]
+
+def tradier_chain(symbol: str, expiry: str) -> Dict[str, List[dict]]:
+    url = "https://api.tradier.com/v1/markets/options/chains"
+    r = R.get(url, params={"symbol": symbol, "expiration": expiry, "greeks": "false"},
+              headers=_tradier_headers(), timeout=7)
+    r.raise_for_status()
+    j = r.json()
+    opts = (((j or {}).get("options") or {}).get("option")) or []
+    calls, puts = [], []
+    for o in opts:
+        try:
+            row = {
+                "strike": float(o.get("strike")),
+                "bid": float(o.get("bid") or 0.0),
+                "ask": float(o.get("ask") or 0.0),
+                "lastPrice": float(o.get("last") or 0.0),
+                "openInterest": int(o.get("open_interest") or 0),
+                "volume": int(o.get("volume") or 0),
+                "impliedVolatility": float(o.get("greeks", {}).get("mid_iv") or 0.0),
+            }
+            if str(o.get("option_type")).lower() == "call":
+                calls.append(row)
+            else:
+                puts.append(row)
+        except Exception:
+            continue
+    return {"calls": calls, "puts": puts}
+
+def yf_expiries(symbol: str) -> List[str]:
+    if yf is None: return []
+    try:
+        return list(getattr(yf.Ticker(symbol), "options", []) or [])
+    except Exception:
+        return []
+
+def yf_chain(symbol: str, expiry: str) -> Optional[Dict[str, List[dict]]]:
+    if yf is None: return None
+    try:
+        oc = yf.Ticker(symbol).option_chain(expiry)
+        return {
+            "calls": oc.calls.to_dict(orient="records"),
+            "puts":  oc.puts.to_dict(orient="records"),
+        }
+    except Exception:
+        return None
+
+# ---------- contract enrichment ----------
 def enrich_contracts(S, expiry_iso, rows, is_call: bool):
     out=[]
     if not rows: return out
@@ -133,67 +220,78 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
         samples=payoff.round(2).tolist()
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
-def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
+# ---------- provider selection & picking ----------
+def _load_chain(symbol: str, dte_lo: int, dte_hi: int):
     """
-    Only yfinance; iterate expiries safely.
-    Skip any expiry that raises (e.g., JSONDecodeError).
+    Prefer Tradier (if TRADIER_TOKEN provided), else yfinance.
+    Always returns a dict with price, expiries, chains, note.
     """
     symbol = symbol.upper().strip()
-    if yf is None:
-        return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
 
-    try:
-        tkr = yf.Ticker(symbol)
-        expiries = list(getattr(tkr, "options", []) or [])
-        today = dt.date.today()
-        valid = []
-        for e in expiries:
-            try:
-                d = dt.date.fromisoformat(e)
-                dte = (d - today).days
-                if dte_lo <= dte <= dte_hi:
-                    valid.append((d, e, dte))
-            except Exception:
-                continue
+    # price first
+    S = _last_price(symbol)
 
-        # Underlying price
-        S = None
+    # expiries
+    expiries: List[str] = []
+    chains: List[Dict] = []
+    note: Optional[str] = None
+
+    if TRADIER_TOKEN:
+        # Tradier path
         try:
-            info = tkr.fast_info
-            S = float(info.get("last_price"))
-        except Exception:
-            try:
-                hist = tkr.history(period="5d", interval="1d")
-                S = float(hist["Close"].dropna().iloc[-1])
-            except Exception:
-                S = None
+            exps = tradier_expirations(symbol)
+            today = dt.date.today()
+            for e in exps:
+                try:
+                    d = dt.date.fromisoformat(e)
+                    dte = (d - today).days
+                    if dte_lo <= dte <= dte_hi:
+                        book = tradier_chain(symbol, e)
+                        chains.append({"expiry": e, "dte": dte, "calls": book["calls"], "puts": book["puts"]})
+                        expiries.append(e)
+                except Exception:
+                    continue
+            if not chains:
+                note = f"No Tradier chains in {dte_lo}–{dte_hi} DTE."
+        except Exception as ex:
+            note = f"Tradier error: {type(ex).__name__}"
+    else:
+        # yfinance path
+        if yf is None:
+            return {"price": S, "expiries": [], "chains": [], "note": "yfinance not installed and no TRADIER_TOKEN"}
+        try:
+            exps = yf_expiries(symbol)
+            today = dt.date.today()
+            for e in exps:
+                try:
+                    d = dt.date.fromisoformat(e)
+                    dte = (d - today).days
+                    if dte_lo <= dte <= dte_hi:
+                        book = yf_chain(symbol, e)
+                        if book:
+                            chains.append({"expiry": e, "dte": dte, "calls": book["calls"], "puts": book["puts"]})
+                            expiries.append(e)
+                except Exception:
+                    continue
+            if not chains:
+                note = f"No usable yfinance chains in {dte_lo}–{dte_hi} DTE."
+        except Exception as ex:
+            note = f"yfinance error: {type(ex).__name__}"
 
-        chains = []
-        for _, e_str, dte in valid:
-            try:
-                oc = tkr.option_chain(e_str)  # may raise JSONDecodeError — handled
-                calls = oc.calls.to_dict(orient="records")
-                puts  = oc.puts.to_dict(orient="records")
-                chains.append({"expiry": e_str, "dte": dte, "calls": calls, "puts": puts})
-            except Exception:
-                continue
-
-        note = None if chains else f"No usable option chains in {dte_lo}–{dte_hi} DTE."
-        return {"price": S, "expiries": [e for _, e, _ in valid], "chains": chains, "note": note}
-
-    except Exception as ex:
-        return {"price": None, "expiries": [], "chains": [], "note": f"yfinance error: {type(ex).__name__}"}
+    return {"price": S, "expiries": expiries, "chains": chains, "note": note}
 
 def load_chain_multiwindow(symbol: str):
-    """Try 21–45 (preferred), then 14–60, then 30–90 DTE."""
     for lo,hi in [(21,45),(14,60),(30,90)]:
-        book = _load_chain_yf(symbol, lo, hi)
+        book = _load_chain(symbol, lo, hi)
         if book.get("chains"):
             book["picked_window"] = (lo,hi)
             return book
         last = book
     last["picked_window"] = None
     return last
+
+def confidence_score_wrapper(c):
+    return confidence_score(c)
 
 def pick_contracts_for_symbol(symbol: str, buying_power: float):
     book = load_chain_multiwindow(symbol)
@@ -215,7 +313,7 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
             if (c.get("oi",0) < 50) and (c.get("volume",0) < 10): continue
             if c.get("delta") is None: continue
             c["delta_diff"]=abs(abs(c["delta"])-target_delta)
-            c["conf"]=confidence_score(c)
+            c["conf"]=confidence_score_wrapper(c)
             c["dte"]=ch["dte"]
             cands.append(c)
 
