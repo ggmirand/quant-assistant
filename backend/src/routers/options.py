@@ -3,6 +3,7 @@ import datetime as dt
 import math
 import numpy as np
 import pandas as pd
+from typing import Optional
 
 try:
     import yfinance as yf
@@ -133,44 +134,53 @@ def simulate_option_pl_samples(symbol: str, S: float, K: float, premium: float, 
     return {"pl_p5": float(p5), "pl_p50": float(p50), "pl_p95": float(p95), "prob_profit": prob_profit, "samples": samples}
 
 def _load_chain_yf(symbol: str, dte_lo: int, dte_hi: int):
-    """Only yfinance; skip malformed expiries safely."""
+    """
+    Only yfinance; iterate expiries safely.
+    Skip any expiry that raises (e.g., JSONDecodeError).
+    """
     symbol = symbol.upper().strip()
     if yf is None:
         return {"price": None, "expiries": [], "chains": [], "note": "yfinance not installed"}
+
     try:
         tkr = yf.Ticker(symbol)
         expiries = list(getattr(tkr, "options", []) or [])
         today = dt.date.today()
-        valid=[]
+        valid = []
         for e in expiries:
             try:
-                d=dt.date.fromisoformat(e); dte=(d-today).days
-                if dte_lo <= dte <= dte_hi: valid.append((d,e,dte))
-            except Exception: 
+                d = dt.date.fromisoformat(e)
+                dte = (d - today).days
+                if dte_lo <= dte <= dte_hi:
+                    valid.append((d, e, dte))
+            except Exception:
                 continue
 
         # Underlying price
-        S=None
+        S = None
         try:
-            info=tkr.fast_info; S=float(info.get("last_price"))
+            info = tkr.fast_info
+            S = float(info.get("last_price"))
         except Exception:
             try:
-                hist=tkr.history(period="5d", interval="1d")
-                S=float(hist["Close"].dropna().iloc[-1])
-            except Exception: S=None
-
-        chains=[]
-        for _,e_str,dte in valid:
-            try:
-                oc=tkr.option_chain(e_str)   # <-- sometimes raises JSONDecodeError; we catch it
-                calls=oc.calls.to_dict(orient="records")
-                puts= oc.puts.to_dict(orient="records")
-                chains.append({"expiry":e_str,"dte":dte,"calls":calls,"puts":puts})
+                hist = tkr.history(period="5d", interval="1d")
+                S = float(hist["Close"].dropna().iloc[-1])
             except Exception:
-                # skip bad expiry instead of failing whole endpoint
+                S = None
+
+        chains = []
+        for _, e_str, dte in valid:
+            try:
+                oc = tkr.option_chain(e_str)  # may raise JSONDecodeError — handled
+                calls = oc.calls.to_dict(orient="records")
+                puts  = oc.puts.to_dict(orient="records")
+                chains.append({"expiry": e_str, "dte": dte, "calls": calls, "puts": puts})
+            except Exception:
                 continue
+
         note = None if chains else f"No usable option chains in {dte_lo}–{dte_hi} DTE."
-        return {"price": S, "expiries": [e for _,e,_ in valid], "chains": chains, "note": note}
+        return {"price": S, "expiries": [e for _, e, _ in valid], "chains": chains, "note": note}
+
     except Exception as ex:
         return {"price": None, "expiries": [], "chains": [], "note": f"yfinance error: {type(ex).__name__}"}
 
@@ -190,6 +200,7 @@ def pick_contracts_for_symbol(symbol: str, buying_power: float):
     S = book.get("price") or 0.0
     if not book.get("chains"):
         return {"note": book.get("note") or "No option expiries fetched.", "under_price": S, "candidates": []}
+
     trend = compute_trend(symbol)
     prefer = trend["trend"]
     target_delta = 0.30
